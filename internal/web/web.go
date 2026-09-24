@@ -68,11 +68,21 @@ var funcs = template.FuncMap{
 	"dueLabel": dueLabel,
 	// dueClass picks the badge colours for a due date.
 	"dueClass": dueClass,
+	// when says how long ago something happened, as a conversation would.
+	"when": func(t time.Time) string { return when(t, time.Now()) },
+	// plural puts a count in front of a word, adding an s unless it is one.
+	"plural": func(n int, word string) string {
+		if n == 1 {
+			return "1 " + word
+		}
+		return strconv.Itoa(n) + " " + word + "s"
+	},
 	// row bundles a task with the page it is shown on, for the "taskrow" template.
 	"row": func(p pageData, t store.Task) taskRow {
 		return taskRow{Task: t, Today: p.Today, Path: p.Path, ShowList: p.View != "list",
 			ShowWho: p.Current != nil && p.Current.Members > 1,
-			Me:      p.User.ID, Members: p.Members}
+			Me:      p.User.ID, Members: p.Members,
+			ShowThread: p.View == "list", Thread: p.Threads[t.ID]}
 	},
 }
 
@@ -81,6 +91,32 @@ const dateLayout = "2006-01-02"
 func parseDate(s string) (time.Time, bool) {
 	t, err := time.Parse(dateLayout, s)
 	return t, err == nil
+}
+
+// when renders a moment relative to now: "just now", "5 min ago", "14:05",
+// "yesterday 14:05", "Sep 22". Times are shown in the server's own zone, as
+// "today" is everywhere else.
+func when(t, now time.Time) string {
+	t, now = t.In(time.Local), now.In(time.Local)
+	d := now.Sub(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return strconv.Itoa(int(d.Minutes())) + " min ago"
+	}
+	y1, m1, d1 := t.Date()
+	y2, m2, d2 := now.Date()
+	if y1 == y2 && m1 == m2 && d1 == d2 {
+		return t.Format("15:04")
+	}
+	if yy, ym, yd := now.AddDate(0, 0, -1).Date(); y1 == yy && m1 == ym && d1 == yd {
+		return "yesterday " + t.Format("15:04")
+	}
+	if y1 == y2 {
+		return t.Format("Jan 2")
+	}
+	return t.Format("Jan 2, 2006")
 }
 
 // dueLabel renders a due date relative to today. A finished task is never
@@ -132,6 +168,10 @@ type taskRow struct {
 	// only appears on a list's own page; elsewhere a task's list is not
 	// necessarily the one whose members were loaded.
 	Members []store.Member
+	// The comments, likewise only on a list's own page. Elsewhere the row
+	// just says how many there are.
+	ShowThread bool
+	Thread     []store.Comment
 }
 
 type Server struct {
@@ -142,15 +182,30 @@ type Server struct {
 	// signups limits how fast one address can create identities, the only
 	// thing a stranger can do here without having one already.
 	signups *limiter
+	// sameOrigin refuses requests that change something when a browser sent
+	// them from another site. SameSite=Lax stops such a request carrying the
+	// victim's cookie, but not its response setting a new one: without this a
+	// page elsewhere could sign you in as someone else, replacing your token.
+	// Requests with no browser headers at all, like the CLI's, are allowed.
+	sameOrigin *http.CrossOriginProtection
+	// demoSeed is set when this server is a public demo: it fills a new
+	// visitor's sandbox and returns the list to show them first.
+	demoSeed func(store.User) (int64, error)
 }
+
+// SetDemo turns the server into a public demo. Everyone who picks a name is
+// given seed's example lists to play with, and the pages say that nothing
+// here lasts. Removing old sandboxes is the caller's job (see package demo).
+func (s *Server) SetDemo(seed func(store.User) (int64, error)) { s.demoSeed = seed }
 
 func New(s *store.Store) *Server {
 	srv := &Server{
-		store:   s,
-		tmpl:    template.Must(template.New("").Funcs(funcs).ParseFS(templateFS, "templates/*.html")),
-		mux:     http.NewServeMux(),
-		hub:     newHub(),
-		signups: newLimiter(signupBurst, signupRefill),
+		store:      s,
+		tmpl:       template.Must(template.New("").Funcs(funcs).ParseFS(templateFS, "templates/*.html")),
+		mux:        http.NewServeMux(),
+		hub:        newHub(),
+		signups:    newLimiter(signupBurst, signupRefill),
+		sameOrigin: http.NewCrossOriginProtection(),
 	}
 	s.SetNotifier(srv.hub.publish)
 	srv.routes()
@@ -171,9 +226,18 @@ const csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 's
 	"img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'self'; " +
 	"frame-ancestors 'none'; base-uri 'none'"
 
+// CloseStreams ends every live-update stream, for a server that is shutting
+// down: register it with http.Server.RegisterOnShutdown. Ordinary requests are
+// left to finish.
+func (s *Server) CloseStreams() { s.hub.close() }
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", csp)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if err := s.sameOrigin.Check(r); err != nil {
+		http.Error(w, "refused: that request came from another site", http.StatusForbidden)
+		return
+	}
 	if token := tokenFrom(r); token != "" {
 		if u, err := s.store.UserByToken(token); err == nil {
 			r = r.WithContext(context.WithValue(r.Context(), userKey{}, &u))
@@ -224,6 +288,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /tasks/{id}/toggle", s.authed(s.formToggleTask))
 	s.mux.HandleFunc("POST /tasks/{id}/edit", s.authed(s.formEditTask))
 	s.mux.HandleFunc("POST /tasks/{id}/assign", s.authed(s.formAssignTask))
+	s.mux.HandleFunc("POST /tasks/{id}/comments", s.authed(s.formAddComment))
+	s.mux.HandleFunc("POST /comments/{id}/delete", s.authed(s.formDeleteComment))
 	s.mux.HandleFunc("POST /tasks/{id}/delete", s.authed(s.formDeleteTask))
 	s.mux.HandleFunc("POST /tasks/{id}/restore", s.authed(s.formRestoreTask))
 
@@ -245,6 +311,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/lists/{id}/tasks", s.apiAddTask)
 	s.mux.HandleFunc("PATCH /api/tasks/{id}", s.apiPatchTask)
 	s.mux.HandleFunc("DELETE /api/tasks/{id}", s.apiDeleteTask)
+	s.mux.HandleFunc("GET /api/tasks/{id}/comments", s.apiComments)
+	s.mux.HandleFunc("POST /api/tasks/{id}/comments", s.apiAddComment)
+	s.mux.HandleFunc("DELETE /api/comments/{id}", s.apiDeleteComment)
 }
 
 // ---- identity ---------------------------------------------------------
@@ -272,6 +341,14 @@ func userID(r *http.Request) int64 {
 	return 0
 }
 
+// isHTTPS reports whether the browser reached us over HTTPS, either directly
+// or through a proxy that terminated TLS and said so. Trusting the header is
+// safe for both of its uses: forging it can only make a cookie stricter or a
+// link more secure than it needed to be, never less.
+func isHTTPS(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
 func setSession(w http.ResponseWriter, r *http.Request, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
@@ -280,7 +357,10 @@ func setSession(w http.ResponseWriter, r *http.Request, token string) {
 		MaxAge:   365 * 24 * 3600,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil,
+		// The token is the whole account, so it must never travel over plain
+		// HTTP. Behind a proxy that terminates TLS, r.TLS is always nil, which
+		// used to leave this off in exactly the deployment it matters most.
+		Secure: isHTTPS(r),
 	})
 }
 
@@ -294,7 +374,7 @@ func safeNext(next string) string {
 
 func baseURL(r *http.Request) string {
 	scheme := "http"
-	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+	if isHTTPS(r) {
 		scheme = "https"
 	}
 	return scheme + "://" + r.Host
@@ -323,9 +403,14 @@ func (s *Server) authed(h userHandler) http.HandlerFunc {
 type simplePage struct {
 	Title, Heading, Subtitle, Action, Next, Button, Error string
 	NeedName, ShowToken                                   bool
+	Demo                                                  bool
 }
 
 func (s *Server) renderTmpl(w http.ResponseWriter, status int, name string, data any) {
+	if p, ok := data.(simplePage); ok {
+		p.Demo = s.demoSeed != nil
+		data = p
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if err := s.tmpl.ExecuteTemplate(w, name, data); err != nil {
@@ -364,7 +449,7 @@ func (s *Server) tooManySignups(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) welcomePost(w http.ResponseWriter, r *http.Request) {
 	next := r.FormValue("next")
-	_, token, err := s.store.CreateUser(r.FormValue("name"))
+	u, token, err := s.store.CreateUser(r.FormValue("name"))
 	if errors.Is(err, store.ErrInvalid) {
 		s.renderTmpl(w, http.StatusBadRequest, "welcome.html", welcomePage(next, "Please enter a name (up to 40 characters)."))
 		return
@@ -373,6 +458,22 @@ func (s *Server) welcomePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setSession(w, r, token)
+	if s.demoSeed != nil {
+		// A demo that starts on an empty page shows nothing, so the visitor
+		// begins inside a list that already has people and work in it,
+		// unless they were on their way somewhere in particular.
+		first, err := s.demoSeed(u)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		if dest := safeNext(next); dest != "/" {
+			http.Redirect(w, r, dest, http.StatusSeeOther)
+			return
+		}
+		http.Redirect(w, r, listPath(first), http.StatusSeeOther)
+		return
+	}
 	http.Redirect(w, r, safeNext(next), http.StatusSeeOther)
 }
 
@@ -435,6 +536,15 @@ func (s *Server) joinPost(w http.ResponseWriter, r *http.Request) {
 	}
 	u := userFrom(r)
 	if u == nil {
+		// Joining without an identity creates one, so it counts against the
+		// same limit as signing up; otherwise one invite link would be a way
+		// round it. Someone already signed in is not creating anybody.
+		if !s.signups.allow(clientIP(r)) {
+			w.Header().Set("Retry-After", "60")
+			s.renderTmpl(w, http.StatusTooManyRequests, "welcome.html",
+				joinPage(l, code, nil, "Too many new names from this connection. Try again in a minute."))
+			return
+		}
 		nu, token, err := s.store.CreateUser(r.FormValue("name"))
 		if errors.Is(err, store.ErrInvalid) {
 			s.renderTmpl(w, http.StatusBadRequest, "welcome.html", joinPage(l, code, nil, "Please enter a name (up to 40 characters)."))
@@ -503,6 +613,7 @@ type pageData struct {
 	TodayCount   int    // tasks overdue or due today, across all lists
 	TodayOverdue bool   // some of those are overdue
 	MineCount    int    // open tasks assigned to me, across all lists
+	Demo         bool   // this server is a public demo
 	Lists        []store.List
 	Current      *store.List
 	Tasks        []store.Task
@@ -511,6 +622,7 @@ type pageData struct {
 	IsOwner      bool        // may delete the list and manage its members
 	Members      []store.Member
 	InviteURL    string
+	Threads      map[int64][]store.Comment // comments by task, on a list's own page
 }
 
 // taskGroup is one section of the Today view.
@@ -521,7 +633,7 @@ type taskGroup struct {
 
 // basePage fills in what every page with the sidebar needs.
 func (s *Server) basePage(r *http.Request, u *store.User, view string) (pageData, error) {
-	d := pageData{View: view, User: u, Path: r.URL.RequestURI(), Today: today()}
+	d := pageData{View: view, User: u, Path: r.URL.RequestURI(), Today: today(), Demo: s.demoSeed != nil}
 	var err error
 	if d.Lists, err = s.store.Lists(u.ID); err != nil {
 		return d, err
@@ -641,6 +753,10 @@ func (s *Server) pageList(w http.ResponseWriter, r *http.Request, u *store.User)
 		tasks = kept
 	}
 	d.Current, d.Tasks, d.Filter, d.IsOwner = &cur, tasks, filter, canManage(cur, u.ID)
+	if d.Threads, err = s.store.ListComments(id); err != nil {
+		s.fail(w, err)
+		return
+	}
 	if !cur.Public() {
 		if d.Members, err = s.store.Members(id); err != nil {
 			s.fail(w, err)
@@ -858,6 +974,48 @@ func (s *Server) formAssignTask(w http.ResponseWriter, r *http.Request, u *store
 		s.fail(w, err)
 		return
 	}
+	http.Redirect(w, r, backTo(r, listPath(t.ListID)), http.StatusSeeOther)
+}
+
+// formAddComment adds to a task's conversation.
+func (s *Server) formAddComment(w http.ResponseWriter, r *http.Request, u *store.User) {
+	id, ok := pathID(r)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	t, _, err := s.store.TaskAccess(id, u.ID)
+	if err != nil {
+		s.htmlErr(w, r, err)
+		return
+	}
+	if _, err := s.store.AddComment(id, u.ID, r.FormValue("body")); err != nil && !errors.Is(err, store.ErrInvalid) {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, backTo(r, listPath(t.ListID)), http.StatusSeeOther)
+}
+
+// formDeleteComment takes back something you said.
+func (s *Server) formDeleteComment(w http.ResponseWriter, r *http.Request, u *store.User) {
+	id, ok := pathID(r)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	c, err := s.store.CommentAccess(id, u.ID)
+	if err != nil {
+		s.htmlErr(w, r, err)
+		return
+	}
+	if err := s.store.DeleteComment(id, u.ID); errors.Is(err, store.ErrForbidden) {
+		http.Error(w, "only the person who wrote a comment can delete it", http.StatusForbidden)
+		return
+	} else if err != nil {
+		s.htmlErr(w, r, err)
+		return
+	}
+	t, _ := s.store.Task(c.TaskID)
 	http.Redirect(w, r, backTo(r, listPath(t.ListID)), http.StatusSeeOther)
 }
 
@@ -1113,6 +1271,64 @@ func (s *Server) apiPatchTask(w http.ResponseWriter, r *http.Request) {
 	s.respond(w, http.StatusOK, t, err)
 }
 
+func (s *Server) apiComments(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if _, _, err := s.store.TaskAccess(id, userID(r)); err != nil {
+		s.respond(w, 0, nil, err)
+		return
+	}
+	cs, err := s.store.Comments(id)
+	s.respond(w, http.StatusOK, cs, err)
+}
+
+func (s *Server) apiAddComment(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	// A comment nobody wrote could never be taken back, and says nothing
+	// about who thinks so, so this is one thing a public list does not let
+	// anonymous callers do.
+	if userID(r) == 0 {
+		writeError(w, http.StatusUnauthorized, "a comment needs an author: run \"doables register <name>\" and use the token it prints")
+		return
+	}
+	var in struct {
+		Body string `json:"body"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if _, _, err := s.store.TaskAccess(id, userID(r)); err != nil {
+		s.respond(w, 0, nil, err)
+		return
+	}
+	c, err := s.store.AddComment(id, userID(r), in.Body)
+	s.respond(w, http.StatusCreated, c, err)
+}
+
+func (s *Server) apiDeleteComment(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if _, err := s.store.CommentAccess(id, userID(r)); err != nil {
+		s.respond(w, 0, nil, err)
+		return
+	}
+	if err := s.store.DeleteComment(id, userID(r)); err != nil {
+		s.respond(w, 0, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) apiRenameList(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
@@ -1178,6 +1394,8 @@ func (s *Server) respond(w http.ResponseWriter, status int, v any, err error) {
 		writeError(w, http.StatusNotFound, "not found")
 	case errors.Is(err, store.ErrInvalid):
 		writeError(w, http.StatusBadRequest, "invalid input: names and titles must not be empty (or too long), dates must be YYYY-MM-DD")
+	case errors.Is(err, store.ErrForbidden):
+		writeError(w, http.StatusForbidden, "only the person who wrote it can do that")
 	case err != nil:
 		log.Printf("api: %v", err)
 		writeError(w, http.StatusInternalServerError, "internal error")

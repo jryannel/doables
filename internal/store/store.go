@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -15,8 +16,9 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("not found")
-	ErrInvalid  = errors.New("invalid input")
+	ErrNotFound  = errors.New("not found")
+	ErrInvalid   = errors.New("invalid input")
+	ErrForbidden = errors.New("not allowed")
 )
 
 const (
@@ -24,9 +26,10 @@ const (
 	maxListNameLen = 80
 	// The same limits the web form enforces, so the API and the CLI cannot
 	// smuggle in something the UI would never let you type.
-	maxTitleLen = 200
-	maxDescLen  = 500
-	dateLayout  = "2006-01-02"
+	maxTitleLen   = 200
+	maxDescLen    = 500
+	maxCommentLen = 500
+	dateLayout    = "2006-01-02"
 	// trashRetention is how long a deleted task stays restorable.
 	trashRetention = "-1 day"
 )
@@ -88,6 +91,19 @@ type Task struct {
 	// particular. Assignee is that person's name.
 	AssigneeID int64  `json:"assignee_id,omitempty"`
 	Assignee   string `json:"assignee,omitempty"`
+	// Comments is how many there are; Comments(id) fetches them.
+	Comments int `json:"comments,omitempty"`
+}
+
+// Comment is one remark on a task: who said what, and when. Unlike the
+// description, which anyone can overwrite, comments only ever add up.
+type Comment struct {
+	ID        int64     `json:"id"`
+	TaskID    int64     `json:"task_id"`
+	AuthorID  int64     `json:"author_id,omitempty"` // 0 once the author's account is gone
+	Author    string    `json:"author,omitempty"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // TaskUpdate is a partial edit: nil fields are left alone. A DueDate pointing
@@ -124,6 +140,9 @@ CREATE TABLE IF NOT EXISTS list_members (
 	joined_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	PRIMARY KEY (list_id, user_id)
 );
+-- The primary key serves "who is on this list"; every page load also asks
+-- "which lists is this person on", which it cannot help with.
+CREATE INDEX IF NOT EXISTS list_members_user_id ON list_members(user_id);
 CREATE TABLE IF NOT EXISTS tasks (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
 	list_id     INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
@@ -138,6 +157,19 @@ CREATE TABLE IF NOT EXISTS tasks (
 	deleted_at  TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS tasks_list_id ON tasks(list_id);
+CREATE TABLE IF NOT EXISTS comments (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+	user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+	body       TEXT NOT NULL,
+	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS comments_task_id ON comments(task_id);
+-- Facts about the database itself, such as whether it belongs to a demo.
+CREATE TABLE IF NOT EXISTS settings (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
 `
 
 // Open opens (creating or upgrading if needed) the SQLite database at path.
@@ -173,6 +205,19 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// tx runs fn in a transaction: all of its writes happen, or none do.
+func (s *Store) tx(fn func(*sql.Tx) error) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
 
 // SetNotifier registers a callback fired after every change. It receives the
 // users who can see the changed list, or all=true when the list is public.
@@ -376,6 +421,53 @@ func (s *Store) UserByToken(token string) (User, error) {
 	return u, err
 }
 
+// IsDemo reports whether this database has been set aside for a public demo.
+func (s *Store) IsDemo() (bool, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM settings WHERE key = 'demo' AND value = '1'`).Scan(&n)
+	return n > 0, err
+}
+
+// MarkDemo sets the database aside for a public demo, for good.
+func (s *Store) MarkDemo() error {
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('demo', '1')`)
+	return err
+}
+
+// UserCount is how many accounts there are.
+func (s *Store) UserCount() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n)
+	return n, err
+}
+
+// PurgeUsersOlderThan deletes every account created more than age ago,
+// together with the lists it owns and everything on them, and reports how
+// many accounts went. It exists for the public demo, where each visitor's
+// sandbox is meant to last a day.
+func (s *Store) PurgeUsersOlderThan(age time.Duration) (int64, error) {
+	cutoff := "-" + strconv.FormatInt(int64(age/time.Second), 10) + " seconds"
+	var n int64
+	err := s.tx(func(tx *sql.Tx) error {
+		// Lists first. Deleting an owner would otherwise leave their lists
+		// ownerless, which in Doables means public: open to every visitor.
+		if _, err := tx.Exec(`DELETE FROM lists WHERE owner_id IN
+			(SELECT id FROM users WHERE created_at < datetime('now', ?))`, cutoff); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`DELETE FROM users WHERE created_at < datetime('now', ?)`, cutoff)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	if err == nil && n > 0 {
+		s.publish(nil, true) // open pages of the people who went will send them to sign in
+	}
+	return n, err
+}
+
 // MarkTokenSaved records that someone has their token somewhere safe, which
 // stops the app reminding them about it.
 func (s *Store) MarkTokenSaved(id int64) error {
@@ -476,16 +568,23 @@ func (s *Store) CreateList(name string, ownerID int64) (List, error) {
 	if err != nil {
 		return List{}, err
 	}
-	res, err := s.db.Exec(`INSERT INTO lists (name, owner_id, invite_code) VALUES (?, ?, ?)`,
-		name, nullID(ownerID), newInviteCode())
+	// The list and its owner's membership go in together: an owned list with
+	// no members is invisible to everyone, its owner included.
+	var id int64
+	err = s.tx(func(tx *sql.Tx) error {
+		res, err := tx.Exec(`INSERT INTO lists (name, owner_id, invite_code) VALUES (?, ?, ?)`,
+			name, nullID(ownerID), newInviteCode())
+		if err != nil {
+			return err
+		}
+		id, _ = res.LastInsertId()
+		if ownerID != 0 {
+			_, err = tx.Exec(`INSERT OR IGNORE INTO list_members (list_id, user_id) VALUES (?, ?)`, id, ownerID)
+		}
+		return err
+	})
 	if err != nil {
 		return List{}, err
-	}
-	id, _ := res.LastInsertId()
-	if ownerID != 0 {
-		if err := s.AddMember(id, ownerID); err != nil {
-			return List{}, err
-		}
 	}
 	s.changed(id)
 	return s.firstList(`WHERE l.id = ?`, id)
@@ -543,10 +642,16 @@ func (s *Store) RestoreList(id, userID int64) (List, error) {
 
 // ClaimList makes userID the owner of a public list, making it private.
 func (s *Store) ClaimList(listID, userID int64) error {
-	if err := s.affected(s.db.Exec(`UPDATE lists SET owner_id = ? WHERE id = ? AND owner_id IS NULL`, userID, listID)); err != nil {
+	// Owning it and belonging to it happen together, for the same reason as
+	// in CreateList.
+	err := s.tx(func(tx *sql.Tx) error {
+		if err := s.affected(tx.Exec(`UPDATE lists SET owner_id = ? WHERE id = ? AND owner_id IS NULL`, userID, listID)); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT OR IGNORE INTO list_members (list_id, user_id) VALUES (?, ?)`, listID, userID)
 		return err
-	}
-	if err := s.AddMember(listID, userID); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	s.publish(nil, true) // everyone who could see it as public must re-check
@@ -577,12 +682,16 @@ func (s *Store) AddMember(listID, userID int64) error {
 // Anything that was assigned to them goes back to being nobody's job, since
 // they can no longer see it.
 func (s *Store) RemoveMember(listID, userID int64) error {
-	if err := s.affected(s.db.Exec(`
-		DELETE FROM list_members WHERE list_id = ? AND user_id = ?
-		AND user_id != (SELECT COALESCE(owner_id, 0) FROM lists WHERE id = ?)`, listID, userID, listID)); err != nil {
+	err := s.tx(func(tx *sql.Tx) error {
+		if err := s.affected(tx.Exec(`
+			DELETE FROM list_members WHERE list_id = ? AND user_id = ?
+			AND user_id != (SELECT COALESCE(owner_id, 0) FROM lists WHERE id = ?)`, listID, userID, listID)); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`UPDATE tasks SET assigned_to = NULL WHERE list_id = ? AND assigned_to = ?`, listID, userID)
 		return err
-	}
-	if _, err := s.db.Exec(`UPDATE tasks SET assigned_to = NULL WHERE list_id = ? AND assigned_to = ?`, listID, userID); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	s.changed(listID, userID)
@@ -617,7 +726,8 @@ func (s *Store) Members(listID int64) ([]Member, error) {
 const taskSelect = `
 	SELECT t.id, t.list_id, l.name, t.title, t.description, t.done, t.created_at,
 	       COALESCE(t.due_date, ''), COALESCE(a.name, ''), COALESCE(d.name, ''),
-	       COALESCE(t.assigned_to, 0), COALESCE(g.name, '')
+	       COALESCE(t.assigned_to, 0), COALESCE(g.name, ''),
+	       (SELECT COUNT(*) FROM comments c WHERE c.task_id = t.id)
 	FROM tasks t
 	JOIN lists l ON l.id = t.list_id
 	LEFT JOIN users a ON a.id = t.added_by
@@ -627,7 +737,7 @@ const taskSelect = `
 func scanTask(sc interface{ Scan(...any) error }) (Task, error) {
 	var t Task
 	err := sc.Scan(&t.ID, &t.ListID, &t.ListName, &t.Title, &t.Description, &t.Done, &t.CreatedAt, &t.DueDate, &t.AddedBy, &t.DoneBy,
-		&t.AssigneeID, &t.Assignee)
+		&t.AssigneeID, &t.Assignee, &t.Comments)
 	return t, err
 }
 
@@ -810,6 +920,115 @@ func (s *Store) AssignedCount(userID int64) (int, error) {
 		WHERE t.deleted_at IS NULL AND t.done = 0 AND t.assigned_to = ?
 		AND `+visibleLists, userID, userID).Scan(&n)
 	return n, err
+}
+
+// ---- comments ----------------------------------------------------------
+
+// AddComment records userID saying body about a task. Access is the caller's
+// job, as for every other task operation.
+func (s *Store) AddComment(taskID, userID int64, body string) (Comment, error) {
+	body = strings.TrimSpace(body)
+	if !okLength(body, maxCommentLen) {
+		return Comment{}, ErrInvalid
+	}
+	t, err := s.Task(taskID)
+	if err != nil {
+		return Comment{}, err
+	}
+	res, err := s.db.Exec(`INSERT INTO comments (task_id, user_id, body) VALUES (?, ?, ?)`,
+		taskID, nullID(userID), body)
+	if err != nil {
+		return Comment{}, err
+	}
+	id, _ := res.LastInsertId()
+	s.changed(t.ListID)
+	return s.comment(id)
+}
+
+const commentSelect = `
+	SELECT c.id, c.task_id, COALESCE(c.user_id, 0), COALESCE(u.name, ''), c.body, c.created_at
+	FROM comments c LEFT JOIN users u ON u.id = c.user_id `
+
+func scanComment(sc interface{ Scan(...any) error }) (Comment, error) {
+	var c Comment
+	err := sc.Scan(&c.ID, &c.TaskID, &c.AuthorID, &c.Author, &c.Body, &c.CreatedAt)
+	return c, err
+}
+
+func (s *Store) comment(id int64) (Comment, error) {
+	c, err := scanComment(s.db.QueryRow(commentSelect+`WHERE c.id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return c, ErrNotFound
+	}
+	return c, err
+}
+
+// Comments returns a task's comments, oldest first, as a conversation reads.
+func (s *Store) Comments(taskID int64) ([]Comment, error) {
+	return s.queryComments(`WHERE c.task_id = ? ORDER BY c.created_at, c.id`, taskID)
+}
+
+// ListComments returns the comments on every task in a list, so a page can
+// show all its threads with one query rather than one per task.
+func (s *Store) ListComments(listID int64) (map[int64][]Comment, error) {
+	cs, err := s.queryComments(`JOIN tasks t ON t.id = c.task_id
+		WHERE t.list_id = ? AND t.deleted_at IS NULL ORDER BY c.created_at, c.id`, listID)
+	if err != nil {
+		return nil, err
+	}
+	byTask := map[int64][]Comment{}
+	for _, c := range cs {
+		byTask[c.TaskID] = append(byTask[c.TaskID], c)
+	}
+	return byTask, nil
+}
+
+func (s *Store) queryComments(where string, args ...any) ([]Comment, error) {
+	rows, err := s.db.Query(commentSelect+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cs := []Comment{}
+	for rows.Next() {
+		c, err := scanComment(rows)
+		if err != nil {
+			return nil, err
+		}
+		cs = append(cs, c)
+	}
+	return cs, rows.Err()
+}
+
+// CommentAccess returns a comment if userID can see the list it is on.
+func (s *Store) CommentAccess(commentID, userID int64) (Comment, error) {
+	c, err := s.comment(commentID)
+	if err != nil {
+		return Comment{}, err
+	}
+	if _, _, err := s.TaskAccess(c.TaskID, userID); err != nil {
+		return Comment{}, err
+	}
+	return c, nil
+}
+
+// DeleteComment removes a comment. Only its author may: what somebody said
+// is theirs to take back, not anybody else's to erase.
+func (s *Store) DeleteComment(commentID, userID int64) error {
+	c, err := s.comment(commentID)
+	if err != nil {
+		return err
+	}
+	if c.AuthorID == 0 || c.AuthorID != userID {
+		return ErrForbidden
+	}
+	if err := s.affected(s.db.Exec(`DELETE FROM comments WHERE id = ?`, commentID)); err != nil {
+		return err
+	}
+	if t, err := s.Task(c.TaskID); err == nil {
+		s.changed(t.ListID)
+	}
+	return nil
 }
 
 // DeleteTask moves a task to the trash. It can be restored for a day.
