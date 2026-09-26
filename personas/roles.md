@@ -1,6 +1,6 @@
 # Role Register
 
-As of: 2026-09-26 | Market: Small teams and groups without a dedicated project tool (agencies and freelancer collectives, small businesses in office and trades, clubs and associations, households and flat shares), 2–20 people per shared list, DACH first, English-speaking users welcome (all from intent.md, marked there as assumptions)
+As of: 2026-09-26 | Market: Small teams and groups without a dedicated project tool (agencies and freelancer collectives, small businesses in office and trades, clubs and associations, households and flat shares), 2–20 people per shared list, DACH first, English-speaking users welcome (all from product-intent.md, marked there as assumptions)
 
 | Role | File | Buying function | Segment | Evidence | Status |
 |---|---|---|---|---|---|
@@ -28,5 +28,5 @@ Status: active (has a profile) | candidate (probably exists, relevance unclear; 
 - In freelancer collectives there is no hierarchy: does the organizer role rotate per project, making "organizer" a situation rather than a role? → [SIG-xxx]
 
 ## Change history
-- 2026-09-26 (no DEC): initial register created by persona-bootstrapper from intent.md, all roles at E0
+- 2026-09-26 (no DEC): initial register created by persona-bootstrapper from product-intent.md, all roles at E0
 - 2026-09-26 (no DEC, bootstrap confirmation by the team): "List organizer" split into two active roles, "Team lead" (agency/SMB team lead who plans the team's week) and "Household organizer" (organizes a household, flat share, or club); task contributor stays active, all others stay candidates

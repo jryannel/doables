@@ -1,6 +1,6 @@
 # Research: Competitors and alternatives
 
-Scope: tools named in intent.md plus specialized household, club, and trades tools that serve the same jobs.
+Scope: tools named in product-intent.md plus specialized household, club, and trades tools that serve the same jobs.
 All accessed 2026-09-26. "Fetched" = page opened and read; "search result" = seen in a web search result summary only (lower confidence, verify before relying on details).
 
 ## Doables (own product, reference)
