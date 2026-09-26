@@ -1,0 +1,4 @@
+private/
+demo/accounts.md
+.playwright-cli/
+.DS_Store
