@@ -1,4 +1,4 @@
-# Intent
+# Product Intent
 
 > Drafted by Claude from the live site (https://doables.gelbkappe.de) and the owner's one-line description ("a task list with sharing and team planning"). Target market, "why now", and success criteria are assumptions – please correct.
 
