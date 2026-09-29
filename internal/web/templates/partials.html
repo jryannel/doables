@@ -31,6 +31,7 @@
     .task-row { transition: background .15s; }
     .task-row:hover { background: var(--tblr-bg-surface-secondary); }
     .task-row .task-actions { opacity: 0; transition: opacity .15s; }
+    .task-more { display: none; }
     .task-row:hover .task-actions, .task-row:focus-within .task-actions { opacity: 1; }
     @media (hover: none) { .task-row .task-actions { opacity: 1; } }
     .task-done .task-title { text-decoration: line-through; color: var(--tblr-secondary); }
@@ -96,6 +97,40 @@
     .comment:hover .comment-delete, .comment:focus-within .comment-delete { opacity: 1; }
     @media (hover: none) { .comment .comment-delete { opacity: 1; } }
 
+    /* #tags: links inside titles and descriptions, and the row of them above a list */
+    .hashtag { display: inline-block; padding: 0 .4rem; border-radius: 999px; font-size: .85em; font-weight: 500;
+           line-height: 1.55; color: var(--tblr-primary); text-decoration: none; white-space: nowrap;
+           background: color-mix(in srgb, var(--tblr-primary) 12%, transparent); }
+    .hashtag:hover { color: var(--tblr-primary); text-decoration: none;
+                 background: color-mix(in srgb, var(--tblr-primary) 22%, transparent); }
+    .hashtag.active, .hashtag.active:hover { color: #fff; background: var(--tblr-primary); }
+    .task-done .hashtag { opacity: .65; }
+    .tag-bar .hashtag { font-size: .8rem; padding: .15rem .55rem; }
+    .tag-bar .tag-count { opacity: .7; margin-left: .2rem; }
+
+    /* Headings inside a list: History's days, and the finished tasks on To do */
+    .list-day { font-size: .75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+                color: var(--tblr-secondary); padding: .5rem 1rem; background: var(--tblr-bg-surface-secondary); }
+    .list-day-note { text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+    /* Comments from other people you have not read yet. They are what the
+       rest of the page is least likely to tell you, so they stand out: a bar
+       beside the task, and the latest one quoted under it. */
+    .task-row.has-unread { box-shadow: inset 3px 0 0 var(--tblr-primary); }
+    .unread-line { display: flex; align-items: center; gap: .5rem; max-width: min(100%, 36rem); margin-top: .3rem;
+                   padding: .3rem .6rem; border-radius: var(--tblr-border-radius); font-size: .875rem;
+                   color: var(--tblr-body-color); text-decoration: none; cursor: pointer; list-style: none;
+                   background: color-mix(in srgb, var(--tblr-primary) 10%, transparent); }
+    .unread-line::-webkit-details-marker { display: none; }
+    .unread-line:hover { color: var(--tblr-body-color); text-decoration: none;
+                         background: color-mix(in srgb, var(--tblr-primary) 18%, transparent); }
+    .unread-line .avatar { flex-shrink: 0; }
+    .unread-line .unread-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .unread-line .badge { flex-shrink: 0; }
+    .comment-new { background: color-mix(in srgb, var(--tblr-primary) 10%, transparent);
+                   border-radius: var(--tblr-border-radius); padding: .35rem .5rem; margin-left: -.5rem; }
+    .unread-dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--tblr-primary); flex-shrink: 0; }
+
     /* Inline editing: [data-edit-scope] toggles between its view and its form */
     [data-edit-scope] [data-edit-form] { display: none; }
     [data-edit-scope].is-editing [data-edit-form] { display: block; }
@@ -131,6 +166,9 @@
     @media (max-width: 991.98px) {
       /* keep content and toasts clear of the tab bar (and the home indicator) */
       .page-wrapper { padding-bottom: calc(72px + env(safe-area-inset-bottom)); }
+      /* ...and when the browser scrolls something into view, such as the comment
+         box it has just focused, stop short of the bar rather than under it */
+      html { scroll-padding-bottom: calc(72px + env(safe-area-inset-bottom)); }
       #toasts { bottom: calc(76px + env(safe-area-inset-bottom)); }
     }
     @media (max-width: 767.98px) {
@@ -146,6 +184,25 @@
       .row > .task-thread-col { padding-left: calc(1.6rem + 1.5rem); }
       .thread-body { padding-left: .5rem; }
       .dropdown-item { padding: .75rem 1rem; }
+      /* A task's actions: one "more" button, opening a menu of them */
+      .task-row .task-more { display: inline-flex; }
+      .task-actions-wrap { position: relative; }
+      .task-row .task-actions { display: none !important; }
+      .task-row.menu-open .task-actions {
+        display: flex !important; flex-direction: column; align-items: stretch; gap: 0 !important; opacity: 1;
+        position: absolute; right: 0; top: calc(100% + .25rem); z-index: 1040; min-width: 13rem; padding: .35rem 0;
+        background: var(--tblr-bg-surface); border: 1px solid var(--tblr-border-color);
+        border-radius: var(--tblr-border-radius); box-shadow: var(--tblr-box-shadow-dropdown, 0 16px 24px rgba(0,0,0,.12)); }
+      .task-row.menu-open .task-actions .btn {
+        width: 100%; height: auto; min-height: 44px; justify-content: flex-start; gap: .75rem;
+        padding: 0 1rem; border-radius: 0; font-size: .9375rem; }
+      .task-row.menu-open .task-actions .btn::after { content: attr(data-label); font-weight: 400; }
+      /* a light highlight, like any menu, rather than the dark pressed button */
+      .task-row.menu-open .task-actions .btn-ghost-secondary:is(:hover, :active, .show) {
+        background: var(--tblr-bg-surface-secondary); color: var(--tblr-body-color); }
+      .task-row.menu-open .task-actions .btn .avatar { width: 1.25rem; height: 1.25rem; font-size: .65rem; }
+      .task-row.menu-open .task-actions form, .task-row.menu-open .task-actions .dropdown { width: 100%; }
+      .tag-bar .hashtag { padding: .45rem .75rem; }
       /* quick-add: just the title and a button; description and date sit behind the details toggle */
       #add-task-form .add-extra { display: none; }
       #add-task-form.show-details .add-extra { display: block; }
@@ -153,9 +210,16 @@
   </style>
 {{end}}
 
+{{/* What is new in a task's conversation: who said the latest thing, what,
+     and how many are new. Argument: store.Unread. */}}
+{{define "unreadpreview"}}{{with .Latest}}
+<span class="avatar avatar-xs rounded-circle bg-{{color .AuthorID}}-lt">{{if .Author}}{{initial .Author}}{{else}}?{{end}}</span>
+<span class="unread-text"><strong>{{if .Author}}{{.Author}}{{else}}Someone who has left{{end}}</strong> {{.Body}}</span>
+{{end}}<span class="badge bg-blue text-white">{{.Count}} new</span>{{end}}
+
 {{/* One task, shown on a list page or in the Today view. Argument: taskRow. */}}
 {{define "taskrow"}}{{with .Task}}
-<div class="list-group-item task-row{{if .Done}} task-done{{end}}" data-edit-scope>
+<div class="list-group-item task-row{{if .Done}} task-done{{end}}{{if $.Unread.Count}} has-unread{{end}}" data-edit-scope>
   <div class="row align-items-center g-3" data-edit-view>
     <div class="col-auto">
       <form method="post" action="/tasks/{{.ID}}/toggle" data-inplace>
@@ -164,8 +228,8 @@
       </form>
     </div>
     <div class="col">
-      <div class="task-title fw-medium">{{.Title}}</div>
-      {{if .Description}}<div class="task-desc text-secondary small">{{.Description}}</div>{{end}}
+      <div class="task-title fw-medium">{{tagged .Title $}}</div>
+      {{if .Description}}<div class="task-desc text-secondary small">{{tagged .Description $}}</div>{{end}}
       {{if .DueDate}}<div class="d-sm-none mt-1"><span class="badge {{dueClass .DueDate $.Today .Done}}"><i class="ti ti-calendar-event me-1"></i>{{dueLabel .DueDate $.Today .Done}}</span></div>{{end}}
       {{if $.ShowList}}<a class="small text-secondary text-decoration-none" href="/lists/{{.ListID}}"><i class="ti ti-list-check me-1"></i>{{.ListName}}</a>{{end}}
       {{if .AssigneeID}}<div class="small{{if eq .AssigneeID $.Me}} text-blue fw-medium{{else}} text-secondary{{end}}"><i class="ti ti-user-pin me-1"></i>{{if eq .AssigneeID $.Me}}Yours{{else}}{{.Assignee}}'s job{{end}}</div>{{end}}
@@ -173,8 +237,12 @@
         {{if .DoneBy}}<div class="text-green small"><i class="ti ti-user-check me-1"></i>Done by {{.DoneBy}}</div>
         {{else if .AddedBy}}<div class="text-secondary small"><i class="ti ti-user me-1"></i>Added by {{.AddedBy}}</div>{{end}}
       {{end}}
-      {{if and (not $.ShowThread) .Comments}}
-      <div class="small text-secondary"><i class="ti ti-message me-1"></i>{{plural .Comments "comment"}}</div>
+      {{if not $.ShowThread}}
+        {{if $.Unread.Count}}
+        <a class="unread-line" href="/lists/{{.ListID}}#thread-{{.ID}}" title="Read what was said">{{template "unreadpreview" $.Unread}}</a>
+        {{else if .Comments}}
+        <div class="small text-secondary"><i class="ti ti-message me-1"></i>{{plural .Comments "comment"}}</div>
+        {{end}}
       {{end}}
     </div>
     {{if .DueDate}}
@@ -182,14 +250,19 @@
       <span class="badge {{dueClass .DueDate $.Today .Done}}" title="Due {{.DueDate}}"><i class="ti ti-calendar-event me-1"></i>{{dueLabel .DueDate $.Today .Done}}</span>
     </div>
     {{end}}
-    <div class="col-auto task-actions d-flex gap-1">
+    <!-- On a phone the actions fold away behind one "more" button, so the
+         title keeps the width; the menu it opens is these same buttons. -->
+    <div class="col-auto task-actions-wrap">
+    <button type="button" class="btn btn-icon btn-ghost-secondary task-more" aria-expanded="false" aria-controls="actions-{{.ID}}" title="More" aria-label="Actions for this task"><i class="ti ti-dots"></i></button>
+    <div class="task-actions d-flex gap-1" id="actions-{{.ID}}">
       {{if $.ShowThread}}
-      <button type="button" class="btn btn-icon btn-sm btn-ghost-secondary" data-open-thread="{{.ID}}" title="Comment" aria-label="Comment on this task"><i class="ti ti-message"></i></button>
+      <button type="button" class="btn btn-icon btn-sm btn-ghost-secondary" data-open-thread="{{.ID}}" title="Comment" aria-label="Comment on this task" data-label="Comment"><i class="ti ti-message"></i></button>
       {{end}}
       {{if $.Members}}
       <div class="dropdown">
         <button type="button" class="btn btn-icon btn-sm btn-ghost-secondary" data-bs-toggle="dropdown" aria-expanded="false"
-                title="{{if .AssigneeID}}For {{.Assignee}}{{else}}Give this to someone{{end}}" aria-label="Assign this task">
+                title="{{if .AssigneeID}}For {{.Assignee}}{{else}}Give this to someone{{end}}" aria-label="Assign this task"
+                data-label="{{if .AssigneeID}}For {{.Assignee}}{{else}}Give to someone{{end}}">
           {{if .AssigneeID}}<span class="avatar avatar-xs rounded-circle bg-{{color .AssigneeID}}-lt">{{initial .Assignee}}</span>
           {{else}}<i class="ti ti-user-plus"></i>{{end}}
         </button>
@@ -210,21 +283,26 @@
         </div>
       </div>
       {{end}}
-      <button type="button" class="btn btn-icon btn-sm btn-ghost-secondary" data-edit-toggle title="Edit task" aria-label="Edit task"><i class="ti ti-pencil"></i></button>
+      <button type="button" class="btn btn-icon btn-sm btn-ghost-secondary" data-edit-toggle title="Edit task" aria-label="Edit task" data-label="Edit"><i class="ti ti-pencil"></i></button>
       <form method="post" action="/tasks/{{.ID}}/delete" data-inplace data-undo>
         <input type="hidden" name="next" value="{{$.Path}}">
-        <button type="submit" class="btn btn-icon btn-sm btn-ghost-danger" title="Delete task" aria-label="Delete task"><i class="ti ti-trash"></i></button>
+        <button type="submit" class="btn btn-icon btn-sm btn-ghost-danger" title="Delete task" aria-label="Delete task" data-label="Delete"><i class="ti ti-trash"></i></button>
       </form>
+    </div>
     </div>
     {{if $.ShowThread}}
     <!-- The conversation gets a line of its own under the task, so on a phone
          it has the whole width, and the tick box and date stay beside the title. -->
     <div class="col-12 task-thread-col">
-        <details class="task-thread{{if not .Comments}} thread-empty{{end}}" data-thread="{{.ID}}">
+        <details class="task-thread{{if not .Comments}} thread-empty{{end}}" data-thread="{{.ID}}" id="thread-{{.ID}}" data-unread="{{$.Unread.Count}}">
+          {{if $.Unread.Count}}
+          <summary class="unread-line">{{template "unreadpreview" $.Unread}}</summary>
+          {{else}}
           <summary class="small"><i class="ti ti-message me-1"></i>{{if .Comments}}{{plural .Comments "comment"}}{{else}}Comment{{end}}</summary>
+          {{end}}
           <div class="thread-body">
             {{range $.Thread}}
-            <div class="comment">
+            <div class="comment{{if index $.Unread.IDs .ID}} comment-new{{end}}" data-comment="{{.ID}}">
               <span class="avatar avatar-xs rounded-circle bg-{{color .AuthorID}}-lt">{{if .Author}}{{initial .Author}}{{else}}?{{end}}</span>
               <div class="flex-fill" style="min-width:0">
                 <div class="small">

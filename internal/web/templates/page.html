@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>{{if eq .View "today"}}Today · {{else if eq .View "mine"}}My tasks · {{else}}{{with .Current}}{{.Name}} · {{end}}{{end}}Doables</title>
+  <title>{{with .UnreadTotal}}({{.}}) {{end}}{{if eq .View "today"}}Today · {{else if eq .View "mine"}}My tasks · {{else}}{{with .Current}}{{.Name}} · {{end}}{{end}}Doables</title>
   {{template "assets"}}
 </head>
 <body>
@@ -62,6 +62,7 @@
               <span class="nav-link-icon d-md-none d-lg-inline-block"><i class="ti ti-list-check"></i></span>
               <span class="nav-link-title text-truncate">{{.Name}}</span>
               <span class="ms-auto d-flex align-items-center gap-2">
+                {{with index $.UnreadByList .ID}}<span class="unread-dot" title="{{plural . "new comment"}}"></span>{{end}}
                 {{if gt .Members 1}}<i class="ti ti-users text-secondary" title="Shared with {{.Members}} people"></i>{{end}}
                 {{if .Open}}<span class="badge bg-blue-lt text-blue">{{.Open}}</span>{{else if .Total}}<i class="ti ti-circle-check-filled text-green"></i>{{end}}
               </span>
@@ -274,12 +275,13 @@
           <div class="card-body">
             <form method="post" action="/lists/{{.ID}}/tasks" id="add-task-form" data-inplace data-reset>
               <input type="hidden" name="next" value="{{$.Path}}">
+              {{if $.Tag}}<input type="hidden" name="tag" value="{{$.Tag}}">{{end}}
               <!-- On phones this is one line (title, details toggle, add); description and date appear under the toggle -->
               <div class="row g-2">
                 <div class="col col-md-4 order-1">
                   <div class="input-icon">
                     <span class="input-icon-addon"><i class="ti ti-pencil"></i></span>
-                    <input type="text" name="title" class="form-control" placeholder="What needs doing?" required maxlength="200" autocomplete="off">
+                    <input type="text" name="title" class="form-control" placeholder="{{if $.Tag}}New #{{$.Tag}} task{{else}}What needs doing?{{end}}" required maxlength="200" autocomplete="off">
                   </div>
                 </div>
                 <div class="col-auto d-md-none order-2">
@@ -306,28 +308,62 @@
         <div class="card" data-live="tasks">
           <div class="card-header">
             <ul class="nav nav-pills card-header-pills">
-              <li class="nav-item"><a class="nav-link{{if eq $.Filter "all"}} active{{end}}" href="/lists/{{.ID}}">All <span class="badge bg-secondary-lt ms-1">{{.Total}}</span></a></li>
-              <li class="nav-item"><a class="nav-link{{if eq $.Filter "open"}} active{{end}}" href="/lists/{{.ID}}?filter=open">Open <span class="badge bg-secondary-lt ms-1">{{.Open}}</span></a></li>
-              <li class="nav-item"><a class="nav-link{{if eq $.Filter "done"}} active{{end}}" href="/lists/{{.ID}}?filter=done">Done <span class="badge bg-secondary-lt ms-1">{{.Done}}</span></a></li>
+              <li class="nav-item"><a class="nav-link{{if eq $.Filter "todo"}} active{{end}}" href="{{listURL .ID $.Tag "todo"}}">To do <span class="badge bg-secondary-lt ms-1">{{$.Count.Open}}</span></a></li>
+              <li class="nav-item"><a class="nav-link{{if eq $.Filter "history"}} active{{end}}" href="{{listURL .ID $.Tag "history"}}"><i class="ti ti-history me-1"></i>History <span class="badge bg-secondary-lt ms-1">{{$.Count.History}}</span></a></li>
             </ul>
           </div>
+          {{if $.TagCounts}}
+          <!-- Every #tag in the list. Clicking one shows only its tasks; clicking it again shows them all. -->
+          <div class="card-body py-2 border-bottom d-flex flex-wrap align-items-center gap-2 tag-bar">
+            {{$list := .ID}}
+            {{range $.TagCounts}}
+            <a class="hashtag{{if eq .Tag $.Tag}} active{{end}}" href="{{tagURL $list .Tag $.Tag $.Filter}}"
+               title="{{if eq .Tag $.Tag}}Show every task again{{else}}Show only tasks tagged #{{.Tag}}{{end}}">#{{.Tag}}<span class="tag-count">{{.Tasks}}</span>{{if eq .Tag $.Tag}}<i class="ti ti-x ms-1"></i>{{end}}</a>
+            {{end}}
+          </div>
+          {{end}}
           <div class="list-group list-group-flush">
-            {{range $.Tasks}}{{template "taskrow" (row $ .)}}
+            {{if eq $.Filter "history"}}
+              <!-- History: everything finished, newest first, a heading a day -->
+              {{range $.Groups}}
+              <div class="list-group-header list-day">{{.Title}}<span class="ms-2 fw-normal">{{len .Tasks}}</span></div>
+              {{range .Tasks}}{{template "taskrow" (row $ .)}}{{end}}
+              {{end}}
             {{else}}
+              {{$finished := false}}
+              {{range $.Tasks}}
+              {{if and .Done (not $finished)}}{{$finished = true}}
+              <div class="list-group-header list-day">Finished in the last day<span class="list-day-note ms-2">· moves to History a day after it's ticked</span></div>
+              {{end}}
+              {{template "taskrow" (row $ .)}}
+              {{end}}
+            {{end}}
+            {{if not $.Tasks}}
             <div class="empty">
-              {{if eq $.Filter "all"}}
-              <div class="empty-icon"><i class="ti ti-mood-smile fs-1"></i></div>
-              <p class="empty-title">Nothing here yet</p>
-              <p class="empty-subtitle text-secondary">Add your first task above.</p>
-              {{else if eq $.Filter "open"}}
+              {{if and $.Tag (not (add $.Count.Open $.Count.History))}}
+              <div class="empty-icon"><i class="ti ti-hash fs-1"></i></div>
+              <p class="empty-title">Nothing tagged #{{$.Tag}}</p>
+              <p class="empty-subtitle text-secondary">No task here mentions it any more. <a href="{{listURL .ID "" $.Filter}}">Show every task</a></p>
+              {{else if eq $.Filter "history"}}
+              <div class="empty-icon"><i class="ti ti-history fs-1"></i></div>
+              <p class="empty-title">Nothing finished yet</p>
+              <p class="empty-subtitle text-secondary">Ticked-off tasks stay on To do for a day, so everyone sees they were done, then move here.</p>
+              {{else if $.Count.History}}
               <div class="empty-icon"><i class="ti ti-confetti fs-1"></i></div>
               <p class="empty-title">All caught up!</p>
-              <p class="empty-subtitle text-secondary">No open tasks in this list.</p>
+              <p class="empty-subtitle text-secondary">Everything finished more than a day ago is in <a href="{{listURL .ID $.Tag "history"}}">History</a>.</p>
               {{else}}
-              <div class="empty-icon"><i class="ti ti-checkbox fs-1"></i></div>
-              <p class="empty-title">Nothing done yet</p>
-              <p class="empty-subtitle text-secondary">Tick a task to move it here.</p>
+              <div class="empty-icon"><i class="ti ti-mood-smile fs-1"></i></div>
+              <p class="empty-title">Nothing here yet</p>
+              <p class="empty-subtitle text-secondary">Add your first task above. Words starting with # become tags, like <span class="hashtag">#shopping</span>, so you can show just those tasks.</p>
               {{end}}
+            </div>
+            {{end}}
+            {{if $.More}}
+            <!-- The rest of a long list, loaded on request (in place, when scripts run) -->
+            <div class="list-group-item d-flex flex-wrap align-items-center justify-content-center gap-2 py-3">
+              <a class="btn" href="{{$.MoreURL}}" data-more><i class="ti ti-chevron-down me-1"></i>Show {{atMost $.More pageSize}} more</a>
+              <span class="text-secondary small">{{len $.Tasks}} of {{add (len $.Tasks) $.More}} shown</span>
             </div>
             {{end}}
           </div>
@@ -347,7 +383,7 @@
                   <span class="avatar bg-blue-lt text-blue me-3"><i class="ti ti-list-check fs-2"></i></span>
                   <div class="flex-fill text-truncate">
                     <div class="fw-bold text-truncate">{{.Name}}</div>
-                    <div class="text-secondary small">{{.Open}} open · {{.Done}} done{{if gt .Members 1}} · <i class="ti ti-users"></i> {{.Members}}{{end}}{{if .Public}} · public{{end}}</div>
+                    <div class="text-secondary small">{{.Open}} open · {{.Done}} done{{if gt .Members 1}} · <i class="ti ti-users"></i> {{.Members}}{{end}}{{if .Public}} · public{{end}}{{with index $.UnreadByList .ID}} · <span class="text-blue fw-medium"><i class="ti ti-message"></i> {{plural . "new comment"}}</span>{{end}}</div>
                   </div>
                   <span class="fw-bold">{{.Percent}}%</span>
                 </div>
@@ -456,6 +492,29 @@
           </div>
         </form>
 
+        {{if .PushKey}}
+        <hr class="my-4">
+
+        <!-- Notifications are per device: this browser is on or off, whatever the others are. -->
+        <h6 class="mb-1"><i class="ti ti-bell me-1"></i>Notifications</h6>
+        <div id="push-panel" data-key="{{.PushKey}}">
+          <p class="text-secondary small mb-2" data-push-state>Checking this device…</p>
+          <div class="d-flex flex-wrap gap-2 mb-3">
+            <button type="button" class="btn btn-primary d-none" id="push-on"><i class="ti ti-bell me-1"></i>Turn on for this device</button>
+            <button type="button" class="btn d-none" id="push-off"><i class="ti ti-bell-off me-1"></i>Turn off for this device</button>
+            <button type="button" class="btn btn-ghost-secondary d-none" id="push-test">Send a test</button>
+          </div>
+          <form method="post" action="/me/notifications" data-inplace data-autosubmit data-toast="Saved">
+            <input type="hidden" name="next" value="{{.Path}}">
+            <div class="small text-secondary mb-1">Tell me when someone:</div>
+            <label class="form-check"><input class="form-check-input" type="checkbox" name="comments" value="on"{{if .Notify.Comments}} checked{{end}}><span class="form-check-label">comments on a task in my lists</span></label>
+            <label class="form-check"><input class="form-check-input" type="checkbox" name="assigned" value="on"{{if .Notify.Assigned}} checked{{end}}><span class="form-check-label">gives me a task</span></label>
+            <label class="form-check"><input class="form-check-input" type="checkbox" name="added" value="on"{{if .Notify.Added}} checked{{end}}><span class="form-check-label">adds a task to a list I share</span></label>
+          </form>
+          <div class="form-hint">Notifications travel through your browser maker's push service (Google, Mozilla or Apple), encrypted so that it cannot read them. Nothing is sent until you turn them on.</div>
+        </div>
+        {{end}}
+
         <hr class="my-4">
 
         <h6 class="mb-1"><i class="ti ti-key me-1"></i>Your sign-in token</h6>
@@ -534,8 +593,11 @@
     // after posting that is exactly where the cursor rests: treating it as
     // busy would stop replies appearing until you clicked somewhere else.
     var idleBox = commentBox(a) && a.value === '';
-    if (a && el.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.type !== 'checkbox' && !idleBox) return true;
-    if (el.querySelector('.dropdown-menu.show')) return true; // a menu is open: don't yank it away
+    // A field that is no longer on screen (an edit cancelled with Esc) is not
+    // being typed in, even if the cursor was left behind in it.
+    var shown = a && a.offsetParent !== null;
+    if (a && shown && el.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.type !== 'checkbox' && !idleBox) return true;
+    if (el.querySelector('.dropdown-menu.show, .task-row.menu-open')) return true; // a menu is open: don't yank it away
     return !!el.querySelector('.is-editing');
   }
 
@@ -575,7 +637,37 @@
       var again = document.querySelector('details[data-thread="' + boxThread + '"] input[name=body]');
       if (again && document.activeElement !== again) again.focus();
     }
+    Object.keys(stillNew).forEach(function (id) {
+      var c = document.querySelector('.comment[data-comment="' + id + '"]');
+      if (c) c.classList.add('comment-new');
+    });
+    // Something said while its thread is open on screen has been seen.
+    document.querySelectorAll('details[data-thread][open]').forEach(function (d) {
+      if (d.getAttribute('data-unread') !== '0') markSeen(d);
+    });
   }
+
+  // Comments that were new when their thread was opened keep standing out
+  // until the page is left, though the server now knows they have been seen.
+  var stillNew = {};
+  var seeing = {};
+
+  // markSeen tells the server a thread has been read, which clears its badge
+  // here and on the reader's other devices.
+  function markSeen(thread) {
+    var id = thread.getAttribute('data-thread');
+    if (seeing[id] || thread.getAttribute('data-unread') === '0') return;
+    seeing[id] = true;
+    thread.querySelectorAll('.comment-new').forEach(function (c) { stillNew[c.getAttribute('data-comment')] = true; });
+    post('/tasks/' + id + '/seen', new URLSearchParams({ next: location.pathname + location.search }))
+      .then(function (html) { if (html !== null) apply(html); })
+      .catch(function () {})
+      .then(function () { delete seeing[id]; });
+  }
+
+  document.addEventListener('toggle', function (e) {
+    if (e.target.matches && e.target.matches('details[data-thread]') && e.target.open) markSeen(e.target);
+  }, true);
 
   function flushPending() {
     if (pending) { pending = false; refresh(); }
@@ -604,6 +696,14 @@
     es.addEventListener('changed', scheduleRefresh);
     es.onopen = function () { if (opened) scheduleRefresh(); opened = true; }; // catch up after a reconnect
   }
+
+  // Some changes come from the clock, not from anyone: a finished task leaves
+  // To do a day after it was ticked, and at midnight "Tomorrow" becomes
+  // "Today". Nobody is told about those, so a page left open (an installed
+  // app can stay open for days) looks again every few minutes while it is on
+  // screen, and as soon as it comes back into view.
+  setInterval(function () { if (!document.hidden) scheduleRefresh(); }, 5 * 60 * 1000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) scheduleRefresh(); });
 
   // ---- in-place form submits ----
   // POST the form, follow the redirect back to this page, and swap the result in.
@@ -664,6 +764,9 @@
     if (!form.matches || !form.matches('[data-inplace]')) return;
     e.preventDefault();
     var params = new URLSearchParams(fieldsOf(form, e.submitter));
+    // Come back to the page as it is now, which "Show more" (or a dropped
+    // ?undo=) may have changed since the form was written into it.
+    if (params.has('next')) params.set('next', location.pathname + location.search);
     var undoID = null;
     if (form.hasAttribute('data-undo')) undoID = new URL(form.action).pathname.split('/')[2];
     post(form.action, params).then(function (html) {
@@ -695,14 +798,58 @@
 
   // Ticking a checkbox saves straight away.
   document.addEventListener('change', function (e) {
-    if (e.target.matches && e.target.matches('.task-check')) {
+    if (e.target.matches && (e.target.matches('.task-check') || e.target.matches('form[data-autosubmit] input'))) {
       var form = e.target.form;
       if (form.requestSubmit) form.requestSubmit(); else form.submit();
     }
   });
 
+  // ---- a task's "more" menu, on phones ----
+  function closeTaskMenus() {
+    var closed = false;
+    document.querySelectorAll('.task-row.menu-open').forEach(function (row) {
+      row.classList.remove('menu-open');
+      row.querySelector('.task-more').setAttribute('aria-expanded', 'false');
+      closed = true;
+    });
+    if (closed) flushPending();
+  }
+
+  document.addEventListener('click', function (e) {
+    var more = e.target.closest('.task-more');
+    if (more) {
+      var row = more.closest('.task-row');
+      var opening = !row.classList.contains('menu-open');
+      closeTaskMenus();
+      if (opening) {
+        row.classList.add('menu-open');
+        more.setAttribute('aria-expanded', 'true');
+      }
+      return;
+    }
+    var inMenu = e.target.closest('.task-row.menu-open .task-actions');
+    // Anything but opening the assign list inside the menu is done with it.
+    if (!inMenu || !e.target.closest('[data-bs-toggle="dropdown"]')) closeTaskMenus();
+  }, true);
+
   // ---- inline editing ----
   document.addEventListener('click', function (e) {
+    // "Show more" fetches the longer page and swaps it in, so the tasks you
+    // were looking at stay where they are rather than jumping to the top.
+    var more = e.target.closest('[data-more]');
+    if (more && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+      e.preventDefault();
+      more.classList.add('disabled');
+      fetch(more.href, { headers: { 'X-Requested-With': 'fetch' }, credentials: 'same-origin' })
+        .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.text(); })
+        .then(function (html) {
+          var there = new URL(more.href);
+          history.replaceState(null, '', there.pathname + there.search);  // live updates keep this many
+          apply(html);
+        })
+        .catch(function () { location.href = more.href; });
+      return;
+    }
     var talk = e.target.closest('[data-open-thread]');
     if (talk) {
       var thread = document.querySelector('details[data-thread="' + talk.getAttribute('data-open-thread') + '"]');
@@ -720,7 +867,7 @@
         var input = scope.querySelector('[data-edit-form] input[type=text]');
         if (input) { input.focus(); input.select(); }
       } else {
-        flushPending();
+        stopEditing(scope);
       }
       return;
     }
@@ -759,10 +906,24 @@
     }
   });
 
+  // stopEditing puts the cursor back where the edit started (the pencil, or
+  // on a phone the task's "more" button), rather than in a form that is no
+  // longer on screen, and lets through live updates held back meanwhile.
+  function stopEditing(scope) {
+    scope.classList.remove('is-editing');
+    var back = scope.querySelector('[data-edit-view] [data-edit-toggle]');
+    if (!back || back.offsetParent === null) back = scope.querySelector('.task-more');
+    if (back && back.offsetParent !== null) back.focus();
+    else if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    flushPending();
+  }
+
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
+    var openMenu = document.querySelector('.task-row.menu-open .task-more');
+    if (openMenu) { closeTaskMenus(); openMenu.focus(); return; }
     var scope = e.target.closest && e.target.closest('.is-editing');
-    if (scope) { scope.classList.remove('is-editing'); flushPending(); }
+    if (scope) stopEditing(scope);
   });
 
   // ---- "+" next to Lists: reveal an inline field for a new list's name ----
@@ -784,6 +945,115 @@
     });
   }
 
+  // ---- notifications on this device ----
+  // A notification that is tapped while Doables is open elsewhere is sent to
+  // that window, rather than opening another.
+  if (navigator.serviceWorker) {
+    navigator.serviceWorker.addEventListener('message', function (e) {
+      if (!e.data || !e.data.navigate) return;
+      var to = new URL(e.data.navigate, location.origin);
+      if (to.origin !== location.origin) return;
+      if (to.pathname + to.search === location.pathname + location.search && to.hash) {
+        history.replaceState(null, '', to.hash);
+        openThreadFromHash();
+      } else {
+        location.href = to.href;
+      }
+    });
+  }
+
+  var pushPanel = document.getElementById('push-panel');
+  if (pushPanel) (function () {
+    var key = pushPanel.getAttribute('data-key');
+    var stateText = pushPanel.querySelector('[data-push-state]');
+    var onBtn = document.getElementById('push-on');
+    var offBtn = document.getElementById('push-off');
+    var testBtn = document.getElementById('push-test');
+    var registration = null;
+
+    // on: true (show Off and Test), false (show On), or null (show neither).
+    function show(text, on) {
+      stateText.textContent = text;
+      onBtn.classList.toggle('d-none', on !== false);
+      offBtn.classList.toggle('d-none', on !== true);
+      testBtn.classList.toggle('d-none', on !== true);
+    }
+    function sendJSON(url, body) {
+      return fetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        .then(function (res) {
+          if (res.ok) return;
+          return res.json().catch(function () { return {}; }).then(function (b) { throw new Error(b.error || ('HTTP ' + res.status)); });
+        });
+    }
+    function keyBytes(b64) {
+      var raw = atob(b64.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - b64.length % 4) % 4));
+      var out = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+      return out;
+    }
+
+    var iOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    var installed = (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+    if (!window.isSecureContext) {
+      show('Notifications need this site to be reached over HTTPS.', null);
+      return;
+    }
+    if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+      show(iOS && !installed
+        ? 'On an iPhone or iPad, add Doables to your Home Screen first (Share, then Add to Home Screen), and turn them on from there.'
+        : 'This browser cannot show notifications.', null);
+      return;
+    }
+
+    navigator.serviceWorker.register('/sw.js').then(function (reg) {
+      registration = reg;
+      return reg.pushManager.getSubscription();
+    }).then(function (sub) {
+      if (Notification.permission === 'denied') {
+        show('Notifications are blocked for this site. You can allow them in your browser\'s site settings.', null);
+      } else if (sub && Notification.permission === 'granted') {
+        // Tell the server again: it may have been someone else's browser
+        // before, or forgotten after a long time without being used.
+        sendJSON('/me/push', sub.toJSON()).catch(function () {});
+        show('On for this device.', true);
+      } else {
+        show('Off for this device.', false);
+      }
+    }).catch(function () { show('This browser cannot show notifications here.', null); });
+
+    onBtn.addEventListener('click', function () {
+      onBtn.disabled = true;
+      Notification.requestPermission().then(function (permission) {
+        if (permission !== 'granted') {
+          show(permission === 'denied'
+            ? 'Notifications are blocked for this site. You can allow them in your browser\'s site settings.'
+            : 'Off for this device.', permission === 'denied' ? null : false);
+          return;
+        }
+        return registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(key) })
+          .then(function (sub) {
+            return sendJSON('/me/push', sub.toJSON()).catch(function (err) { sub.unsubscribe(); throw err; });
+          })
+          .then(function () { show('On for this device.', true); });
+      }).catch(function (err) {
+        show('Could not turn them on: ' + err.message, false);
+      }).then(function () { onBtn.disabled = false; });
+    });
+
+    offBtn.addEventListener('click', function () {
+      registration.pushManager.getSubscription().then(function (sub) {
+        if (!sub) return;
+        return sendJSON('/me/push/delete', { endpoint: sub.endpoint }).then(function () { return sub.unsubscribe(); });
+      }).then(function () { show('Off for this device.', false); })
+        .catch(function (err) { show('Could not turn them off: ' + err.message, true); });
+    });
+
+    testBtn.addEventListener('click', function () {
+      sendJSON('/me/push/test', {}).then(function () { toast('Sent. It should arrive in a moment.', null, 4000); })
+        .catch(function (err) { toast('Could not send it: ' + err.message); });
+    });
+  })();
+
   // ---- profile dialog: the token is fetched only when asked for, and forgotten on close ----
   var tokenInput = document.getElementById('token');
   var tokenLoaded = false;
@@ -803,6 +1073,17 @@
     var titleBox = document.querySelector('#add-task-form input[name=title]');
     if (titleBox) titleBox.focus();
   }
+
+  // Following a comment preview (#thread-12) opens that thread, whether it
+  // came from another page or this one.
+  function openThreadFromHash() {
+    var thread = /^#thread-[0-9]+$/.test(location.hash) && document.getElementById(location.hash.slice(1));
+    if (!thread) return;
+    thread.open = true;
+    thread.closest('.task-row').scrollIntoView({ block: 'center' });
+  }
+  openThreadFromHash();
+  window.addEventListener('hashchange', openThreadFromHash);
 
   // Re-open a dialog when the URL asks for one (#share after sharing actions, #profile from old /me links).
   var wanted = { '#share': '[data-bs-target="#share-modal"]', '#profile': '#profile-open' }[location.hash];

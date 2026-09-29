@@ -10,7 +10,14 @@ Includes a CLI (Cobra + Resty) that talks to the server's JSON API.
 
 One binary serves everything, including its own CSS, JavaScript and fonts, so a page load
 reaches nothing but your own server: no CDN learns who is using your lists, and the app works
-on a network with no way out.
+on a network with no way out. The one exception is notifications, which nobody gets until they
+turn them on (see [Notifications](#notifications)).
+
+Everyone sharing a list sees the same thing at the same time. Sam adds a task on his phone and it
+is on Alex's laptop at once; Alex ticks one off and Sam sees it done; Sam asks something and Alex
+can't miss it:
+
+<img alt="Two screens side by side. Sam, on a phone, adds a task and it appears on Alex's laptop; Alex ticks a task off and it shows as done on Sam's phone; Sam comments on a task and Alex's screen highlights it until Alex opens the conversation" src="docs/live.gif">
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/list-dark.png">
@@ -102,8 +109,28 @@ font down to the icons the templates actually use (8KB rather than 844KB).
   the description, which anyone can overwrite, comments only add up; you can delete your own, nobody else's.
   A task shows how many it has everywhere, and the conversation itself on the list's page. New comments
   appear as they are written, and a half-typed one is never lost to someone else's change.
+- **Hard to miss.** Until you have read what someone else said, the task has a blue bar beside it and
+  quotes their latest comment with how many are new ("Sam: Friday works · 2 new"); the list has a dot in
+  the sidebar and says so on Overview; and the browser tab's title starts with the count, as in
+  "(3) Weekend in Lisbon". Opening the thread marks it read, on your other devices too, and what was
+  new stays picked out while you read it. Comments from before you joined a list don't count, and
+  neither do your own. On Today and My tasks the quote links straight to the conversation.
+- **Tags.** Put a word starting with `#` in a task's title or description, as in "Buy adapters #shopping",
+  and it becomes a tag. Click one to show only the tasks with it; click it again to show them all. The
+  list's tags are shown above its tasks, with how many each has. There is nothing to set up or tidy
+  away: a tag exists while some task mentions it, and `#Shopping` and `#shopping` are the same. A task
+  added while a tag is showing gets that tag, so it doesn't vanish as soon as you add it. Numbers like
+  "issue #12" are not tags.
 - **Due dates.** Optional on every task. Tasks show a badge ("Today", "Tomorrow", red "Overdue · Sep 17"), and
   open tasks sort soonest-due first.
+- **To do and History.** A list's **To do** tab is what is left, plus whatever was finished in the last
+  24 hours, under its own heading, so everyone sees what the others just got done and a mistaken tick can
+  be taken back. A day after it was ticked off, a task moves to **History**: every finished task, most
+  recently finished first, under a heading for each day, with who finished it. Nothing is deleted; untick
+  one in History and it is back on To do. The day is counted from when it was ticked, so something finished
+  at 23:55 does not vanish five minutes later.
+- **Long lists.** A list shows 50 tasks at a time with **Show 50 more** at the bottom, which loads in place;
+  live updates keep however many you have opened.
 - **Today view.** The **Today** item in the sidebar gathers every open task with a due date across all your
   lists: **Overdue**, **Today** and **Next 7 days**. Its badge counts what is overdue or due today (red when
   something is overdue). "Today" is the server's local date.
@@ -118,11 +145,46 @@ font down to the icons the templates actually use (8KB rather than 844KB).
 
 The layout adapts to the screen: on phones and tablets the sidebar becomes a hamburger menu and a **bottom tab bar**
 (Overview, Today with its badge, and your profile) appears; quick-add is a single line with a details button for the
-description and due date; touch targets are at least 44px; inputs are 16px so iPhones don't zoom in when you tap them.
+description and due date; a task's actions (comment, assign, edit, delete) fold into one **⋯** button, so its title
+gets the width of the screen; touch targets are at least 44px; inputs are 16px so iPhones don't zoom in when you tap them.
 
 It is also **installable**: in Chrome/Edge choose *Install*, on iOS Safari *Share → Add to Home Screen*. You get an icon and a
-window without browser chrome. There is no service worker, so it needs a connection to your server (it is not usable
-offline). Installing from a non-`localhost` address needs HTTPS.
+window without browser chrome. It needs a connection to your server (it is not usable offline). Installing from a
+non-`localhost` address needs HTTPS.
+
+## Notifications
+
+Doables can tell you when something happens while you are not looking: a notification on your phone or computer,
+which opens the task when you tap it. In your **profile**, press **Turn on for this device** and let the browser
+show them; each device is turned on separately. Then choose what about:
+
+- someone **comments** on a task in one of your lists (on to begin with)
+- someone **gives you a task** (on to begin with)
+- someone **adds a task** to a list you share (off to begin with, as a busy shopping list would be a lot)
+
+You are never told about what you did yourself. **Send a test** checks that they arrive.
+
+They need HTTPS (or `localhost`). On an iPhone or iPad they work once Doables is on the Home Screen (iOS 16.4 or later),
+and are turned on from there.
+
+**Where they go.** This is the one thing that leaves your server. Browsers only accept notifications through their
+maker's push service (Google's for Chrome and Edge on Android, Mozilla's for Firefox, Apple's for Safari, Microsoft's
+for Edge on Windows), so that is where the server sends them. Each one is encrypted for the one browser it is for, so
+the push service cannot read it; it learns that a notification was sent to that browser, and when. Nothing is sent
+for anyone who has not turned them on. The server only ever sends to those push services, over HTTPS, whatever a
+browser asks for.
+
+For whoever runs the server:
+
+| Variable | |
+|---|---|
+| `DOABLES_PUSH=off` | switch notifications off entirely; the option disappears from the profile (flag `-push=false`) |
+| `DOABLES_PUSH_CONTACT` | an email address or `https://` URL where push services can reach you, if they ever need to. By default it is the `https://` address the server is used at |
+| `DOABLES_PUSH_HOSTS` | other push services to allow, comma-separated, for a browser that uses one not listed above |
+
+The server makes its own key pair the first time and keeps it in the database. Every subscription is tied to it,
+so it lives and dies with your data: restore a backup and notifications keep working. A demo (`DOABLES_DEMO=1`)
+never sends any, as the other people in it are pretend.
 
 ## Sharing lists with other people
 
@@ -159,6 +221,8 @@ export DOABLES_TOKEN=<token>   # PowerShell: $env:DOABLES_TOKEN = "<token>"
 doables new-list "Groceries"
 doables add 1 "Buy milk" -d "2 litres" --due 2026-10-01
 doables tasks 1
+doables tasks 1 --tag shopping   # only the tasks tagged #shopping
+doables tasks 1 --history        # everything finished, most recently first
 doables edit 3 --title "Buy oat milk" --due 2026-10-05   # only the flags you give are changed
 doables edit 3 --due ""                                  # clear the due date
 doables assign 3 2    # give task 3 to member 2 (see `doables members`)
@@ -203,7 +267,7 @@ Dates are `YYYY-MM-DD`.
 | DELETE | `/api/lists/{id}` | owner only; the list can be restored for a day |
 | POST | `/api/lists/{id}/restore` | owner only, within a day of deleting it |
 | GET | `/api/lists/{id}/members` | |
-| GET | `/api/lists/{id}/tasks` | |
+| GET | `/api/lists/{id}/tasks` | every task; `?view=todo` for the To do tab (open, and finished in the last day), `?view=history` for finished ones; `?tag=shopping` for only that tag. Each task lists its `tags`, and `done_at` once finished |
 | POST | `/api/lists/{id}/tasks` | `{"title": "...", "description": "...", "due_date": "..."}` |
 | PATCH | `/api/tasks/{id}` | any of `{"done": true, "title": "...", "description": "...", "due_date": "...", "assignee_id": 2}`; `"due_date": ""` clears the date and `"assignee_id": 0` clears the assignee |
 | DELETE | `/api/tasks/{id}` | moves the task to the trash |
@@ -233,6 +297,12 @@ python tools/screenshots/shoot.py
 It starts a server on a spare port, fills it with a shared list, photographs it with
 headless Chrome and writes the PNGs into `docs/`, cleaning up after itself. It needs Go,
 Chrome and `python -m pip install websockets`.
+
+The animation at the top is `python tools/screenshots/livegif.py`, which also needs
+`python -m pip install pillow`. It drives two Chromes, one each for Alex and Sam, and writes
+`docs/live.gif`. It is a storyboard, not a screen recording: each frame is taken once the page
+shows what it is meant to, so the result is the same on any machine. What reaches the other
+screen still gets there through the app's own live updates.
 
 ## Who is downloading it
 

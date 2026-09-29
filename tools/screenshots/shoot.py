@@ -123,7 +123,7 @@ class API:
 
 def seed(api):
     """Fill an empty database with a shared list worth photographing, and
-    return the owner's token. Dates are relative, so "Yesterday", "Today" and
+    return everyone's tokens by name (Alex owns the lists). Dates are relative, so "Yesterday", "Today" and
     "Tomorrow" are always right whenever this is run."""
     today = date.today()
     day = lambda n: (today + timedelta(days=n)).isoformat()
@@ -154,14 +154,14 @@ def seed(api):
 
     # Alex is 1, Sam is 2, Rae is 3: the order they were created in above.
     trip_id = trip["id"]
-    task(trip_id, alex, "Sort out the airport transfer", "Seven of us, two bags each", day(-1), 1)
-    ferry = task(trip_id, sam, "Book the ferry to Cacilhas", "Friday evening, before sunset", day(0), 2)
+    task(trip_id, alex, "Sort out the airport transfer #transport", "Seven of us, two bags each", day(-1), 1)
+    ferry = task(trip_id, sam, "Book the ferry to Cacilhas #transport", "Friday evening, before sunset", day(0), 2)
     api(f"/api/tasks/{ferry['id']}/comments", {"body": "Is the 7pm one still running in September?"}, rae)
     api(f"/api/tasks/{ferry['id']}/comments", {"body": "Checked: last one is 21:30"}, sam)
-    task(trip_id, alex, "Find somewhere for dinner on Friday", "Somewhere near the water", day(1), 3)
-    task(trip_id, rae, "Renew the travel card", "", day(4), 3)
-    task(trip_id, alex, "Pack the camera", "And the spare battery", "", 1)
-    task(trip_id, sam, "Buy travel adapters", "", "", None, done=True)
+    task(trip_id, alex, "Find somewhere for dinner on Friday #food", "Somewhere near the water", day(1), 3)
+    task(trip_id, rae, "Renew the travel card #transport", "", day(4), 3)
+    task(trip_id, alex, "Pack the camera #packing", "And the spare battery", "", 1)
+    task(trip_id, sam, "Buy travel adapters #packing", "", "", None, done=True)
 
     flat = lists["Flat move"]["id"]
     task(flat, alex, "Call the letting agent", "Ask about the deposit", day(0), 1)
@@ -169,7 +169,7 @@ def seed(api):
     task(flat, alex, "Book a van", "", day(3), 1)
 
     task(lists["Reading"]["id"], alex, "Finish the Go book", "Chapter 12 onwards", day(3), 1)
-    return alex
+    return people
 
 
 def page_target(port):
@@ -241,7 +241,7 @@ def main():
         wait_for(base + "/welcome", "the server")
 
         print("seeding the demo data")
-        token = seed(API(base))
+        token = seed(API(base))["Alex"]
 
         print("starting Chrome")
         browser = subprocess.Popen(

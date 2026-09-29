@@ -3,19 +3,23 @@ package web
 import (
 	"context"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html/template"
 	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"doables/internal/push"
 	"doables/internal/store"
 )
 
@@ -47,6 +51,19 @@ func serveManifest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/manifest+json")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	io.WriteString(w, manifestJSON)
+}
+
+// serveServiceWorker serves the script that shows notifications. Browsers
+// check it for updates themselves; no-cache makes them always ask.
+func serveServiceWorker(w http.ResponseWriter, r *http.Request) {
+	js, err := staticFS.ReadFile("static/sw.js")
+	if err != nil {
+		http.Error(w, "missing", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write(js)
 }
 
 const cookieName = "doables_token"
@@ -82,8 +99,125 @@ var funcs = template.FuncMap{
 		return taskRow{Task: t, Today: p.Today, Path: p.Path, ShowList: p.View != "list",
 			ShowWho: p.Current != nil && p.Current.Members > 1,
 			Me:      p.User.ID, Members: p.Members,
-			ShowThread: p.View == "list", Thread: p.Threads[t.ID]}
+			ShowThread: p.View == "list", Thread: p.Threads[t.ID],
+			Tag: p.Tag, Filter: p.Filter, Unread: p.Unread[t.ID]}
 	},
+	// tagged shows a task's title or description with its #tags as links.
+	"tagged": tagged,
+	// listURL and tagURL are the addresses of a list shown a particular way.
+	"listURL": listURL,
+	"tagURL":  tagURL,
+	// atMost is the smaller of n and max, e.g. "Show 50 more" when 200 are left.
+	"atMost":   func(n, max int) int { return min(n, max) },
+	"pageSize": func() int { return pageSize },
+	"add":      func(a, b int) int { return a + b },
+}
+
+// listURL is the address of a list's To do or History tab ("todo" or
+// "history"), showing only the tasks with tag when it is not empty.
+func listURL(listID int64, tag, filter string) string {
+	q := url.Values{}
+	if tag != "" {
+		q.Set("tag", tag)
+	}
+	if filter == "history" {
+		q.Set("filter", filter)
+	}
+	if len(q) == 0 {
+		return listPath(listID)
+	}
+	return listPath(listID) + "?" + q.Encode()
+}
+
+// FinishedStays is how long a finished task stays on its list's To do tab
+// before it moves to History: long enough for everyone to see it was done,
+// and to take back a tick by mistake. It is counted from the moment it was
+// ticked, so something finished at 23:55 does not vanish five minutes later.
+const FinishedStays = 24 * time.Hour
+
+// onToDo reports whether a task belongs on its list's To do tab. A task
+// finished before Doables recorded when is long gone from it.
+func onToDo(t store.Task, now time.Time) bool {
+	return !t.Done || (t.DoneAt != nil && now.Sub(*t.DoneAt) < FinishedStays)
+}
+
+// byDayFinished splits finished tasks, newest first, into one group a day.
+func byDayFinished(tasks []store.Task, now time.Time) []taskGroup {
+	var groups []taskGroup
+	for _, t := range tasks {
+		title := "Earlier" // finished before Doables recorded when
+		if t.DoneAt != nil {
+			title = dayTitle(*t.DoneAt, now)
+		}
+		if len(groups) == 0 || groups[len(groups)-1].Title != title {
+			groups = append(groups, taskGroup{Title: title})
+		}
+		g := &groups[len(groups)-1]
+		g.Tasks = append(g.Tasks, t)
+	}
+	return groups
+}
+
+// dayTitle names the day t fell on, in the server's own zone like "today"
+// everywhere else: "Today", "Yesterday", "Monday" within the week, then
+// "Mon, Sep 22", and "Sep 22, 2025" in another year.
+func dayTitle(t, now time.Time) string {
+	t, now = t.In(time.Local), now.In(time.Local)
+	day := func(x time.Time) time.Time { y, m, d := x.Date(); return time.Date(y, m, d, 0, 0, 0, 0, time.Local) }
+	switch days := int(day(now).Sub(day(t)).Hours()/24 + 0.5); {
+	case days <= 0:
+		return "Today"
+	case days == 1:
+		return "Yesterday"
+	case days < 7:
+		return t.Format("Monday")
+	case t.Year() == now.Year():
+		return t.Format("Mon, Jan 2")
+	default:
+		return t.Format("Jan 2, 2006")
+	}
+}
+
+// pageSize is how many tasks a list page shows before offering more.
+const pageSize = 50
+
+// withShow asks a list address for its first n tasks.
+func withShow(listURL string, n int) string {
+	sep := "?"
+	if strings.Contains(listURL, "?") {
+		sep = "&"
+	}
+	return listURL + sep + "show=" + strconv.Itoa(n)
+}
+
+// tagURL is where clicking tag takes you: the list showing only that tag,
+// still open or done as it was. Clicking the tag already being shown goes back
+// to every task, so a second click undoes the first.
+func tagURL(listID int64, tag, current, filter string) string {
+	if tag == current {
+		tag = ""
+	}
+	return listURL(listID, tag, filter)
+}
+
+// tagged renders text with each #tag in it as a link that shows the task's
+// list filtered to that tag. Everything else is escaped as usual.
+func tagged(text string, row taskRow) template.HTML {
+	var b strings.Builder
+	last := 0
+	for _, m := range store.FindTags(text) {
+		b.WriteString(template.HTMLEscapeString(text[last:m.Start]))
+		class, title := "hashtag", "Show only tasks tagged "+text[m.Start:m.End]
+		if m.Tag == row.Tag {
+			class, title = "hashtag active", "Show every task again"
+		}
+		fmt.Fprintf(&b, `<a class="%s" href="%s" title="%s">%s</a>`, class,
+			template.HTMLEscapeString(tagURL(row.Task.ListID, m.Tag, row.Tag, row.Filter)),
+			template.HTMLEscapeString(title), template.HTMLEscapeString(text[m.Start:m.End]))
+		last = m.End
+	}
+	b.WriteString(template.HTMLEscapeString(text[last:]))
+	return template.HTML(b.String())
 }
 
 const dateLayout = "2006-01-02"
@@ -172,6 +306,11 @@ type taskRow struct {
 	// just says how many there are.
 	ShowThread bool
 	Thread     []store.Comment
+	// The tag and Open/Done filter the list is shown with, so a task's tags
+	// can link to the list filtered the same way, or undo the filter.
+	Tag, Filter string
+	// Unread is what other people have said here that the viewer has not seen.
+	Unread store.Unread
 }
 
 type Server struct {
@@ -191,7 +330,22 @@ type Server struct {
 	// demoSeed is set when this server is a public demo: it fills a new
 	// visitor's sandbox and returns the list to show them first.
 	demoSeed func(store.User) (int64, error)
+	// now is the time, which tests move on to see a day pass.
+	now func() time.Time
+	// push sends notifications to people's browsers; nil when they are
+	// switched off (and in a demo, where the other people are pretend).
+	push Pusher
 }
+
+// Pusher is what the server needs from package push.
+type Pusher interface {
+	PublicKey() string
+	Accepts(endpoint string) bool
+	Notify(users []int64, msg push.Message)
+}
+
+// SetPush turns notifications on.
+func (s *Server) SetPush(p Pusher) { s.push = p }
 
 // SetDemo turns the server into a public demo. Everyone who picks a name is
 // given seed's example lists to play with, and the pages say that nothing
@@ -206,6 +360,7 @@ func New(s *store.Store) *Server {
 		hub:        newHub(),
 		signups:    newLimiter(signupBurst, signupRefill),
 		sameOrigin: http.NewCrossOriginProtection(),
+		now:        time.Now,
 	}
 	s.SetNotifier(srv.hub.publish)
 	srv.routes()
@@ -234,6 +389,14 @@ func (s *Server) CloseStreams() { s.hub.close() }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", csp)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// What comes back depends on whether the browser takes gzip, so a cache
+	// between us must not hand one kind to the other.
+	w.Header().Add("Vary", "Accept-Encoding")
+	if wantsGzip(r) {
+		gw := &gzipResponse{ResponseWriter: w}
+		defer gw.finish()
+		w = gw
+	}
 	if err := s.sameOrigin.Check(r); err != nil {
 		http.Error(w, "refused: that request came from another site", http.StatusForbidden)
 		return
@@ -258,6 +421,8 @@ func (s *Server) routes() {
 		files.ServeHTTP(w, r)
 	})
 	s.mux.HandleFunc("GET /manifest.webmanifest", serveManifest)
+	// The service worker has to live at the root to look after every page.
+	s.mux.HandleFunc("GET /sw.js", serveServiceWorker)
 
 	// Sign-in and sharing
 	s.mux.HandleFunc("GET /welcome", s.welcomeGet)
@@ -269,6 +434,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /me/token", s.authed(s.meToken))
 	s.mux.HandleFunc("POST /me/token/saved", s.authed(s.meTokenSaved))
 	s.mux.HandleFunc("POST /me", s.authed(s.mePost))
+	s.mux.HandleFunc("POST /me/push", s.authed(s.mePushOn))
+	s.mux.HandleFunc("POST /me/push/delete", s.authed(s.mePushOff))
+	s.mux.HandleFunc("POST /me/push/test", s.authed(s.mePushTest))
+	s.mux.HandleFunc("POST /me/notifications", s.authed(s.meNotifyPrefs))
 
 	// HTML UI
 	s.mux.HandleFunc("GET /{$}", s.authed(s.pageIndex))
@@ -290,6 +459,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /tasks/{id}/assign", s.authed(s.formAssignTask))
 	s.mux.HandleFunc("POST /tasks/{id}/comments", s.authed(s.formAddComment))
 	s.mux.HandleFunc("POST /comments/{id}/delete", s.authed(s.formDeleteComment))
+	s.mux.HandleFunc("POST /tasks/{id}/seen", s.authed(s.formSeen))
 	s.mux.HandleFunc("POST /tasks/{id}/delete", s.authed(s.formDeleteTask))
 	s.mux.HandleFunc("POST /tasks/{id}/restore", s.authed(s.formRestoreTask))
 
@@ -603,6 +773,185 @@ func (s *Server) mePost(w http.ResponseWriter, r *http.Request, u *store.User) {
 	http.Redirect(w, r, backTo(r, "/"), http.StatusSeeOther)
 }
 
+// ---- notifications ----------------------------------------------------
+
+// mePushOn keeps a browser's permission to be notified, after the person
+// using it said yes. The browser posts its subscription as it gives it.
+func (s *Server) mePushOn(w http.ResponseWriter, r *http.Request, u *store.User) {
+	if s.push == nil {
+		writeError(w, http.StatusNotFound, "notifications are switched off on this server")
+		return
+	}
+	var in struct {
+		Endpoint string `json:"endpoint"`
+		Keys     struct {
+			P256dh string `json:"p256dh"`
+			Auth   string `json:"auth"`
+		} `json:"keys"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if !s.push.Accepts(in.Endpoint) {
+		writeError(w, http.StatusBadRequest, "that is not a push service this server sends notifications through")
+		return
+	}
+	// A P-256 public key, uncompressed, and a 16-byte secret: anything else
+	// could never be encrypted for, and would only fail later, quietly.
+	if k, err := b64url(in.Keys.P256dh); err != nil || len(k) != 65 || k[0] != 4 {
+		writeError(w, http.StatusBadRequest, "the subscription's key is not one a browser would give")
+		return
+	}
+	if a, err := b64url(in.Keys.Auth); err != nil || len(a) != 16 {
+		writeError(w, http.StatusBadRequest, "the subscription's secret is not one a browser would give")
+		return
+	}
+	err := s.store.SavePushSubscription(store.PushSubscription{
+		UserID: u.ID, Endpoint: in.Endpoint, P256dh: in.Keys.P256dh, Auth: in.Keys.Auth})
+	if err != nil {
+		s.respond(w, 0, nil, err)
+		return
+	}
+	// Push services want a way to reach whoever runs a server that sends
+	// them things; the address people use it at will do.
+	if isHTTPS(r) {
+		if err := s.store.NotePushContact(baseURL(r)); err != nil {
+			log.Printf("push: %v", err)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// mePushOff forgets a browser, when its owner turns notifications off in it.
+func (s *Server) mePushOff(w http.ResponseWriter, r *http.Request, u *store.User) {
+	var in struct {
+		Endpoint string `json:"endpoint"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if err := s.store.RemovePushSubscription(u.ID, in.Endpoint); err != nil {
+		s.respond(w, 0, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// mePushTest sends the caller a notification, to see that they arrive.
+func (s *Server) mePushTest(w http.ResponseWriter, r *http.Request, u *store.User) {
+	if s.push == nil {
+		writeError(w, http.StatusNotFound, "notifications are switched off on this server")
+		return
+	}
+	s.push.Notify([]int64{u.ID}, push.Message{
+		Title: "Notifications are on",
+		Body:  "This is how Doables will tell you about new comments, and tasks given to you.",
+		URL:   "/", Tag: "test",
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// meNotifyPrefs changes what the caller is notified about.
+func (s *Server) meNotifyPrefs(w http.ResponseWriter, r *http.Request, u *store.User) {
+	p := store.NotifyPrefs{
+		Comments: r.FormValue("comments") != "",
+		Assigned: r.FormValue("assigned") != "",
+		Added:    r.FormValue("added") != "",
+	}
+	if err := s.store.SetNotifyPrefs(u.ID, p); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, backTo(r, "/"), http.StatusSeeOther)
+}
+
+// b64url decodes base64url with or without padding, as browsers send either.
+func b64url(v string) ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(strings.TrimRight(v, "="))
+}
+
+// clip shortens text for a notification, which shows a line or two at most.
+func clip(text string, max int) string {
+	text = strings.Join(strings.Fields(text), " ")
+	if utf8.RuneCountInString(text) <= max {
+		return text
+	}
+	r := []rune(text)
+	return strings.TrimSpace(string(r[:max-1])) + "…"
+}
+
+func nameOf(u *store.User) string {
+	if u == nil {
+		return "Someone"
+	}
+	return u.Name
+}
+
+func actorID(u *store.User) int64 {
+	if u == nil {
+		return 0
+	}
+	return u.ID
+}
+
+// notify sends msg to the people on listID who want to hear about kind,
+// leaving out whoever did it; only, when set, narrows it to one person.
+func (s *Server) notify(kind store.Notice, listID int64, actor *store.User, only int64, msg push.Message) {
+	if s.push == nil {
+		return
+	}
+	ids, err := s.store.ToNotify(kind, listID, actorID(actor))
+	if err != nil {
+		log.Printf("push: %v", err)
+		return
+	}
+	if only != 0 {
+		if !slices.Contains(ids, only) {
+			return
+		}
+		ids = []int64{only}
+	}
+	if len(ids) > 0 {
+		s.push.Notify(ids, msg)
+	}
+}
+
+// announceComment tells a list's people what someone said about a task,
+// with a link that opens the conversation.
+func (s *Server) announceComment(actor *store.User, t store.Task, c store.Comment) {
+	s.notify(store.NoticeComment, t.ListID, actor, 0, push.Message{
+		Title: nameOf(actor) + " on “" + clip(t.Title, 60) + "”",
+		Body:  clip(c.Body, 180),
+		URL:   listPath(t.ListID) + "#thread-" + strconv.FormatInt(t.ID, 10),
+		Tag:   "comment-" + strconv.FormatInt(t.ID, 10),
+	})
+}
+
+// announceAssigned tells someone they have been given a task, unless they
+// gave it to themselves or already had it.
+func (s *Server) announceAssigned(actor *store.User, before, after store.Task) {
+	if after.AssigneeID == 0 || after.AssigneeID == before.AssigneeID || after.AssigneeID == actorID(actor) {
+		return
+	}
+	s.notify(store.NoticeAssigned, after.ListID, actor, after.AssigneeID, push.Message{
+		Title: nameOf(actor) + " gave you “" + clip(after.Title, 60) + "”",
+		Body:  "In " + after.ListName,
+		URL:   listPath(after.ListID),
+		Tag:   "assigned-" + strconv.FormatInt(after.ID, 10),
+	})
+}
+
+// announceAdded tells a list's people about a new task. Several in a row
+// replace each other rather than piling up.
+func (s *Server) announceAdded(actor *store.User, t store.Task) {
+	s.notify(store.NoticeAdded, t.ListID, actor, 0, push.Message{
+		Title: nameOf(actor) + " added “" + clip(t.Title, 60) + "”",
+		Body:  "To " + t.ListName,
+		URL:   listPath(t.ListID),
+		Tag:   "added-" + strconv.FormatInt(t.ListID, 10),
+	})
+}
+
 // ---- HTML UI ----------------------------------------------------------
 
 type pageData struct {
@@ -617,12 +966,30 @@ type pageData struct {
 	Lists        []store.List
 	Current      *store.List
 	Tasks        []store.Task
-	Groups       []taskGroup // Today view sections
-	Filter       string      // "all", "open" or "done"
-	IsOwner      bool        // may delete the list and manage its members
-	Members      []store.Member
-	InviteURL    string
-	Threads      map[int64][]store.Comment // comments by task, on a list's own page
+	Groups       []taskGroup // Today's sections, or History's days
+	Filter       string      // a list's tab: "todo" or "history"
+	Tag          string      // only tasks with this #tag are shown, when set
+	TagCounts    []store.TagCount
+	// Count is the tasks with the tag, if any: open ones for the To do tab,
+	// finished ones for History.
+	Count struct{ Open, History int }
+	// More is how many tasks are not shown yet, a list being shown pageSize
+	// at a time; MoreURL shows the next ones as well.
+	More      int
+	MoreURL   string
+	IsOwner   bool // may delete the list and manage its members
+	Members   []store.Member
+	InviteURL string
+	Threads   map[int64][]store.Comment // comments by task, on a list's own page
+	// Comments by other people the viewer has not seen yet: by task, the
+	// total by list for the sidebar and Overview, and in all, for the title.
+	Unread       map[int64]store.Unread
+	UnreadByList map[int64]int
+	UnreadTotal  int
+	// PushKey is what a browser needs to turn notifications on, empty when
+	// they are switched off; Notify is what this person wants them about.
+	PushKey string
+	Notify  store.NotifyPrefs
 }
 
 // taskGroup is one section of the Today view.
@@ -643,8 +1010,23 @@ func (s *Server) basePage(r *http.Request, u *store.User, view string) (pageData
 		return d, err
 	}
 	d.TodayCount, d.TodayOverdue = overdue+due, overdue > 0
-	d.MineCount, err = s.store.AssignedCount(u.ID)
-	return d, err
+	if d.MineCount, err = s.store.AssignedCount(u.ID); err != nil {
+		return d, err
+	}
+	if d.Unread, err = s.store.Unread(u.ID); err != nil {
+		return d, err
+	}
+	d.UnreadByList = store.UnreadByList(d.Unread)
+	for _, n := range d.UnreadByList {
+		d.UnreadTotal += n
+	}
+	if s.push != nil {
+		d.PushKey = s.push.PublicKey()
+		if d.Notify, err = s.store.NotifyPrefs(u.ID); err != nil {
+			return d, err
+		}
+	}
+	return d, nil
 }
 
 // backTo is where an action should send the browser: the page it came from
@@ -739,18 +1121,51 @@ func (s *Server) pageList(w http.ResponseWriter, r *http.Request, u *store.User)
 		s.fail(w, err)
 		return
 	}
+	// A list has two tabs. To do is what is left, plus what was finished in
+	// the last day, so everyone sees what the others just got done and can
+	// take back a mistaken tick. History is everything ever finished.
 	filter := r.URL.Query().Get("filter")
-	if filter != "open" && filter != "done" {
-		filter = "all"
+	if filter == "done" {
+		filter = "history" // what the Done tab was, before History
 	}
-	if filter != "all" {
-		kept := tasks[:0]
-		for _, t := range tasks {
-			if t.Done == (filter == "done") {
-				kept = append(kept, t)
-			}
+	if filter != "history" {
+		filter = "todo"
+	}
+	now := s.now()
+	var shown []store.Task
+	for _, t := range tasks {
+		if (filter == "history" && t.Done) || (filter == "todo" && onToDo(t, now)) {
+			shown = append(shown, t)
 		}
-		tasks = kept
+	}
+	// The tags are the tab's, so each one's count is what clicking it shows,
+	// but from before filtering by a tag, so the row of them stays whole.
+	d.TagCounts = store.CountTags(shown)
+	if tag, ok := store.NormalizeTag(r.URL.Query().Get("tag")); ok {
+		d.Tag, tasks, shown = tag, store.WithTag(tasks, tag), store.WithTag(shown, tag)
+	}
+	for _, t := range tasks {
+		if t.Done {
+			d.Count.History++
+		} else {
+			d.Count.Open++
+		}
+	}
+	tasks = shown
+	// Every row carries its own menus and forms, a few KB each, and every
+	// change anyone makes sends the page again to everyone looking at it, so
+	// a list a year old with a thousand finished tasks would be megabytes.
+	// Show the first pageSize, and more on request (?show=).
+	limit := pageSize
+	if n, err := strconv.Atoi(r.URL.Query().Get("show")); err == nil && n > limit {
+		limit = n
+	}
+	if len(tasks) > limit {
+		d.More, tasks = len(tasks)-limit, tasks[:limit]
+		d.MoreURL = withShow(listURL(id, d.Tag, filter), limit+pageSize)
+	}
+	if filter == "history" {
+		d.Groups = byDayFinished(tasks, now)
 	}
 	d.Current, d.Tasks, d.Filter, d.IsOwner = &cur, tasks, filter, canManage(cur, u.ID)
 	if d.Threads, err = s.store.ListComments(id); err != nil {
@@ -904,10 +1319,21 @@ func (s *Server) formAddTask(w http.ResponseWriter, r *http.Request, u *store.Us
 		s.htmlErr(w, r, err)
 		return
 	}
-	_, err := s.store.AddTask(id, u.ID, r.FormValue("title"), r.FormValue("description"), r.FormValue("due"))
+	title := r.FormValue("title")
+	// A task added while the list is showing only #shopping would vanish
+	// the moment it was added, so it is tagged #shopping too.
+	if tag, ok := store.NormalizeTag(r.FormValue("tag")); ok && strings.TrimSpace(title) != "" {
+		if !slices.Contains(store.TagsIn(title, r.FormValue("description")), tag) {
+			title = strings.TrimRight(title, " ") + " #" + tag
+		}
+	}
+	t, err := s.store.AddTask(id, u.ID, title, r.FormValue("description"), r.FormValue("due"))
 	if err != nil && !errors.Is(err, store.ErrInvalid) {
 		s.fail(w, err)
 		return
+	}
+	if err == nil {
+		s.announceAdded(u, t)
 	}
 	http.Redirect(w, r, backTo(r, listPath(id)), http.StatusSeeOther)
 }
@@ -970,9 +1396,13 @@ func (s *Server) formAssignTask(w http.ResponseWriter, r *http.Request, u *store
 			return
 		}
 	}
-	if _, err := s.store.AssignTask(id, assignee); err != nil && !errors.Is(err, store.ErrInvalid) {
+	after, err := s.store.AssignTask(id, assignee)
+	if err != nil && !errors.Is(err, store.ErrInvalid) {
 		s.fail(w, err)
 		return
+	}
+	if err == nil {
+		s.announceAssigned(u, t, after)
 	}
 	http.Redirect(w, r, backTo(r, listPath(t.ListID)), http.StatusSeeOther)
 }
@@ -989,7 +1419,31 @@ func (s *Server) formAddComment(w http.ResponseWriter, r *http.Request, u *store
 		s.htmlErr(w, r, err)
 		return
 	}
-	if _, err := s.store.AddComment(id, u.ID, r.FormValue("body")); err != nil && !errors.Is(err, store.ErrInvalid) {
+	c, err := s.store.AddComment(id, u.ID, r.FormValue("body"))
+	if err != nil && !errors.Is(err, store.ErrInvalid) {
+		s.fail(w, err)
+		return
+	}
+	if err == nil {
+		s.announceComment(u, t, c)
+	}
+	http.Redirect(w, r, backTo(r, listPath(t.ListID)), http.StatusSeeOther)
+}
+
+// formSeen records that the caller has read a task's conversation, which the
+// page does when its thread is opened.
+func (s *Server) formSeen(w http.ResponseWriter, r *http.Request, u *store.User) {
+	id, ok := pathID(r)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	t, _, err := s.store.TaskAccess(id, u.ID)
+	if err != nil {
+		s.htmlErr(w, r, err)
+		return
+	}
+	if err := s.store.MarkSeen(u.ID, id); err != nil {
 		s.fail(w, err)
 		return
 	}
@@ -1201,7 +1655,30 @@ func (s *Server) apiTasks(w http.ResponseWriter, r *http.Request) {
 		s.respond(w, 0, nil, err)
 		return
 	}
+	view := r.URL.Query().Get("view")
+	if view != "" && view != "todo" && view != "history" {
+		writeError(w, http.StatusBadRequest, `view is "todo" (open, and finished in the last day) or "history" (finished); leave it out for every task`)
+		return
+	}
+	var tag string
+	if q := r.URL.Query().Get("tag"); q != "" {
+		var ok bool
+		if tag, ok = store.NormalizeTag(q); !ok {
+			writeError(w, http.StatusBadRequest, "invalid tag: a tag is one word with a letter in it, like #shopping")
+			return
+		}
+	}
 	tasks, err := s.store.Tasks(id)
+	if tag != "" {
+		tasks = store.WithTag(tasks, tag)
+	}
+	now := s.now()
+	switch view {
+	case "todo":
+		tasks = slices.DeleteFunc(tasks, func(t store.Task) bool { return !onToDo(t, now) })
+	case "history":
+		tasks = slices.DeleteFunc(tasks, func(t store.Task) bool { return !t.Done })
+	}
 	s.respond(w, http.StatusOK, tasks, err)
 }
 
@@ -1224,6 +1701,9 @@ func (s *Server) apiAddTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t, err := s.store.AddTask(id, userID(r), in.Title, in.Description, in.DueDate)
+	if err == nil {
+		s.announceAdded(userFrom(r), t)
+	}
 	s.respond(w, http.StatusCreated, t, err)
 }
 
@@ -1249,12 +1729,12 @@ func (s *Server) apiPatchTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, `provide at least one of "done", "title", "description", "due_date", "assignee_id"`)
 		return
 	}
-	if _, _, err := s.store.TaskAccess(id, userID(r)); err != nil {
+	before, _, err := s.store.TaskAccess(id, userID(r))
+	if err != nil {
 		s.respond(w, 0, nil, err)
 		return
 	}
 	var t store.Task
-	var err error
 	if in.Title != nil || in.Description != nil || in.DueDate != nil {
 		t, err = s.store.UpdateTask(id, store.TaskUpdate{Title: in.Title, Description: in.Description, DueDate: in.DueDate})
 	}
@@ -1263,6 +1743,9 @@ func (s *Server) apiPatchTask(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, store.ErrInvalid) {
 			writeError(w, http.StatusBadRequest, "that person is not on this list")
 			return
+		}
+		if err == nil {
+			s.announceAssigned(userFrom(r), before, t)
 		}
 	}
 	if err == nil && in.Done != nil {
@@ -1282,6 +1765,10 @@ func (s *Server) apiComments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cs, err := s.store.Comments(id)
+	// Reading the conversation through the API is reading it.
+	if err == nil && userID(r) != 0 {
+		err = s.store.MarkSeen(userID(r), id)
+	}
 	s.respond(w, http.StatusOK, cs, err)
 }
 
@@ -1304,11 +1791,15 @@ func (s *Server) apiAddComment(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	if _, _, err := s.store.TaskAccess(id, userID(r)); err != nil {
+	t, _, err := s.store.TaskAccess(id, userID(r))
+	if err != nil {
 		s.respond(w, 0, nil, err)
 		return
 	}
 	c, err := s.store.AddComment(id, userID(r), in.Body)
+	if err == nil {
+		s.announceComment(userFrom(r), t, c)
+	}
 	s.respond(w, http.StatusCreated, c, err)
 }
 

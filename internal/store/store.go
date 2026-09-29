@@ -9,6 +9,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -93,6 +94,11 @@ type Task struct {
 	Assignee   string `json:"assignee,omitempty"`
 	// Comments is how many there are; Comments(id) fetches them.
 	Comments int `json:"comments,omitempty"`
+	// Tags are the #words in the title and description (see FindTags).
+	Tags []string `json:"tags,omitempty"`
+	// DoneAt is when it was ticked off, nil while it is open and for tasks
+	// finished before Doables recorded the time.
+	DoneAt *time.Time `json:"done_at,omitempty"`
 }
 
 // Comment is one remark on a task: who said what, and when. Unlike the
@@ -117,6 +123,24 @@ type TaskUpdate struct {
 type Store struct {
 	db     *sql.DB
 	notify func(userIDs []int64, all bool)
+
+	// lastDone is the finish time most recently given to a task. Finish times
+	// order a list's finished tasks, so two ticked in the same instant (the
+	// clock on Windows moves in steps) must still get different ones.
+	doneMu   sync.Mutex
+	lastDone time.Time
+}
+
+// finishTime is now, or just after the last finish time handed out.
+func (s *Store) finishTime() time.Time {
+	s.doneMu.Lock()
+	defer s.doneMu.Unlock()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if !now.After(s.lastDone) {
+		now = s.lastDone.Add(time.Microsecond)
+	}
+	s.lastDone = now
+	return now
 }
 
 const schema = `
@@ -165,6 +189,23 @@ CREATE TABLE IF NOT EXISTS comments (
 	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS comments_task_id ON comments(task_id);
+-- Browsers that asked to be sent notifications (see push.go).
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	endpoint   TEXT NOT NULL UNIQUE,
+	p256dh     TEXT NOT NULL,
+	auth       TEXT NOT NULL,
+	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS push_subscriptions_user_id ON push_subscriptions(user_id);
+-- The newest comment each person has seen on each task (see unread.go).
+CREATE TABLE IF NOT EXISTS comment_reads (
+	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+	seen_up_to INTEGER NOT NULL,
+	PRIMARY KEY (user_id, task_id)
+);
 -- Facts about the database itself, such as whether it belongs to a demo.
 CREATE TABLE IF NOT EXISTS settings (
 	key   TEXT PRIMARY KEY,
@@ -227,6 +268,11 @@ func (s *Store) SetNotifier(fn func(userIDs []int64, all bool)) { s.notify = fn 
 func (s *Store) migrate() error {
 	for _, c := range []struct{ table, column, def string }{
 		{"users", "token_saved", "INTEGER NOT NULL DEFAULT 0"},
+		// What each person wants notifications about (see push.go). New
+		// tasks on a busy shared list would be a lot, so that one starts off.
+		{"users", "notify_comments", "INTEGER NOT NULL DEFAULT 1"},
+		{"users", "notify_assigned", "INTEGER NOT NULL DEFAULT 1"},
+		{"users", "notify_added", "INTEGER NOT NULL DEFAULT 0"},
 		{"lists", "owner_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL"},
 		{"lists", "invite_code", "TEXT"},
 		{"lists", "deleted_at", "TIMESTAMP"},
@@ -235,6 +281,9 @@ func (s *Store) migrate() error {
 		{"tasks", "assigned_to", "INTEGER REFERENCES users(id) ON DELETE SET NULL"},
 		{"tasks", "due_date", "TEXT"},
 		{"tasks", "deleted_at", "TIMESTAMP"},
+		// When it was ticked off, so the most recently finished come first.
+		// Tasks finished before this column existed have none.
+		{"tasks", "done_at", "TEXT"},
 	} {
 		has, err := s.hasColumn(c.table, c.column)
 		if err != nil {
@@ -245,6 +294,10 @@ func (s *Store) migrate() error {
 				return err
 			}
 		}
+	}
+
+	if err := s.startUnreadCounting(); err != nil {
+		return err
 	}
 
 	// Indexes on columns added above: they cannot live in the schema, which
@@ -727,17 +780,31 @@ const taskSelect = `
 	SELECT t.id, t.list_id, l.name, t.title, t.description, t.done, t.created_at,
 	       COALESCE(t.due_date, ''), COALESCE(a.name, ''), COALESCE(d.name, ''),
 	       COALESCE(t.assigned_to, 0), COALESCE(g.name, ''),
-	       (SELECT COUNT(*) FROM comments c WHERE c.task_id = t.id)
+	       (SELECT COUNT(*) FROM comments c WHERE c.task_id = t.id),
+	       CASE WHEN t.done THEN t.done_at END
 	FROM tasks t
 	JOIN lists l ON l.id = t.list_id
 	LEFT JOIN users a ON a.id = t.added_by
 	LEFT JOIN users d ON d.id = t.done_by
 	LEFT JOIN users g ON g.id = t.assigned_to `
 
+// doneAtLayout is how tasks.done_at is stored: UTC, to the microsecond, and
+// fixed width so that sorting the text sorts the times.
+const doneAtLayout = "2006-01-02 15:04:05.000000"
+
 func scanTask(sc interface{ Scan(...any) error }) (Task, error) {
 	var t Task
+	var doneAt sql.NullString
 	err := sc.Scan(&t.ID, &t.ListID, &t.ListName, &t.Title, &t.Description, &t.Done, &t.CreatedAt, &t.DueDate, &t.AddedBy, &t.DoneBy,
-		&t.AssigneeID, &t.Assignee, &t.Comments)
+		&t.AssigneeID, &t.Assignee, &t.Comments, &doneAt)
+	t.Tags = TagsIn(t.Title, t.Description)
+	if doneAt.Valid {
+		// Without a fraction in the layout, Parse takes any number of digits,
+		// so milliseconds written by the first release that kept this work too.
+		if at, perr := time.Parse(time.DateTime, doneAt.String); perr == nil {
+			t.DoneAt = &at
+		}
+	}
 	return t, err
 }
 
@@ -758,10 +825,16 @@ func (s *Store) queryTasks(where string, args ...any) ([]Task, error) {
 	return tasks, rows.Err()
 }
 
-// Tasks returns a list's tasks: open ones first, soonest due date first.
+// Tasks returns a list's tasks: the open ones first, soonest due first, then
+// the finished ones, most recently finished first. A list used for a year is
+// mostly finished tasks, and the ones worth seeing are the ones just done.
 func (s *Store) Tasks(listID int64) ([]Task, error) {
 	return s.queryTasks(`WHERE t.list_id = ? AND t.deleted_at IS NULL
-		ORDER BY t.done, t.due_date IS NULL, t.due_date, t.id`, listID)
+		ORDER BY t.done,
+			CASE WHEN NOT t.done THEN t.due_date IS NULL END,
+			CASE WHEN NOT t.done THEN t.due_date END,
+			CASE WHEN NOT t.done THEN t.id END,
+			t.done_at IS NULL, t.done_at DESC, t.id DESC`, listID)
 }
 
 func (s *Store) oneTask(where string, id int64) (Task, error) {
@@ -866,7 +939,12 @@ func (s *Store) SetDone(id int64, done bool, userID int64) (Task, error) {
 	if done {
 		by = nullID(userID)
 	}
-	if err := s.affected(s.db.Exec(`UPDATE tasks SET done = ?, done_by = ? WHERE id = ? AND deleted_at IS NULL`, done, by, id)); err != nil {
+	var at any
+	if done {
+		at = s.finishTime().Format(doneAtLayout)
+	}
+	if err := s.affected(s.db.Exec(`UPDATE tasks SET done = ?, done_by = ?, done_at = ?
+		WHERE id = ? AND deleted_at IS NULL`, done, by, at, id)); err != nil {
 		return Task{}, err
 	}
 	t, err := s.Task(id)
@@ -941,6 +1019,12 @@ func (s *Store) AddComment(taskID, userID int64, body string) (Comment, error) {
 		return Comment{}, err
 	}
 	id, _ := res.LastInsertId()
+	// Whoever writes a comment has read the conversation they are answering.
+	if userID != 0 {
+		if err := s.markSeen(userID, taskID); err != nil {
+			return Comment{}, err
+		}
+	}
 	s.changed(t.ListID)
 	return s.comment(id)
 }

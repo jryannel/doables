@@ -234,3 +234,39 @@ func TestCLITalksAboutTasks(t *testing.T) {
 		t.Error("a deleted comment is still listed")
 	}
 }
+
+func TestCLIFiltersByTag(t *testing.T) {
+	c := newCLI(t)
+	c.signIn("Alex")
+	c.run("new-list", "Home")
+	c.run("add", "1", "Milk #shopping")
+	c.run("add", "1", "Call mum")
+
+	for _, tag := range []string{"shopping", "#Shopping"} {
+		out := c.run("tasks", "1", "--tag", tag)
+		contains(t, "tasks --tag "+tag, out, "Milk #shopping")
+		if strings.Contains(out, "Call mum") {
+			t.Errorf("tasks --tag %s listed an untagged task:\n%s", tag, out)
+		}
+	}
+	if out, err := c.try("tasks", "1", "--tag", "two words"); err == nil || !strings.Contains(err.Error(), "invalid tag") {
+		t.Errorf("an invalid tag gave %v:\n%s", err, out)
+	}
+}
+
+func TestCLIShowsToDoAndHistory(t *testing.T) {
+	c := newCLI(t)
+	c.signIn("Alex")
+	c.run("new-list", "Home")
+	c.run("add", "1", "Milk")
+	c.run("add", "1", "Bread")
+	c.run("done", "1")
+
+	// Just finished, Milk is still on To do, and already in the history.
+	contains(t, "tasks", c.run("tasks", "1"), "Milk")
+	history := c.run("tasks", "1", "--history")
+	contains(t, "tasks --history", history, "Milk")
+	if strings.Contains(history, "Bread") {
+		t.Errorf("the history lists an open task:\n%s", history)
+	}
+}
